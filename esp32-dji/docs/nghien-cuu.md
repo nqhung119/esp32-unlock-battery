@@ -267,6 +267,23 @@ Khung trên giả định BMS không bật PEC, giống đường I²C trong bà
 | Unseal thành công nhưng PF reset lại ngay | Điều kiện PF còn tồn tại | Dừng, sửa lỗi phần cứng/cell trước. |
 | PF sạch, điện áp/nhiệt độ hợp lý, BMS sealed | BMS đã qua kiểm tra giao thức | Chuyển sang thử sạc/xả có giám sát. |
 
+## Sử dụng firmware ESP32
+
+Firmware trong `src/main.c` chạy trên UART 115200 baud, tự tạo một full dump khi khởi động nếu BMS ACK tại `0x0B`. GPIO mặc định là SDA = GPIO21, SCL = GPIO22, tốc độ I²C = 50 kHz và pull-up nội bị tắt.
+
+| Lệnh UART | Chức năng |
+| --- | --- |
+| `help` | In danh sách lệnh. |
+| `probe` | Kiểm tra ACK duy nhất tại `0x0B`; không quét mù bus. |
+| `snapshot` | Log trạng thái cốt lõi SBS/BQ30. |
+| `dump` | Log đầy đủ raw block, trạng thái PF, điện áp/nhiệt độ, lifetime và Impedance Track. |
+| `watch on` / `watch off` | Bật/tắt snapshot mỗi 2 giây. |
+| `unseal CONFIRM` | Chạy SHA-1 challenge/response với candidate key cấu hình sẵn. |
+| `pf-reset CONFIRM` | Chỉ reset PF trong session đã unseal; firmware luôn gửi Seal sau đó. |
+| `seal CONFIRM` | Gửi Seal ngay và kết thúc session ghi. |
+
+Các lệnh ghi không tự chạy khi khởi động. Firmware từ chối `pf-reset` nếu chưa unseal hoặc nếu `PFStatus` chứa cờ nghiêm trọng như copper deposition, thermistor, cầu chì, AFE, PTC, Instruction Flash, Open VCx hoặc Data Flash write failure. Cả giá trị raw lẫn giải mã PF/OperationStatus đều được in UART để lưu bằng chứng trước và sau thao tác.
+
 ## Tài liệu đối chiếu
 
 - [Bài hướng dẫn gốc của Ludovic](https://ludovic.cool/make-a-custom-battery-for-dji-mavic-pro/)
