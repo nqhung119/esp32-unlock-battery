@@ -271,6 +271,8 @@ Khung trên giả định BMS không bật PEC, giống đường I²C trong bà
 
 Firmware trong `src/main.c` chạy trên UART 115200 baud, tự tạo một full dump khi khởi động nếu BMS ACK tại `0x0B`. GPIO mặc định là SDA = GPIO21, SCL = GPIO22, tốc độ I²C = 50 kHz và pull-up nội bị tắt.
 
+Nếu boot log báo `I2C idle levels: SDA=0` hoặc `SCL=0`, bus đang bị kéo thấp: dừng thao tác ghi và kiểm tra đúng chân SMBD/SMBC, GND logic, mạch chuyển mức/cách ly, pull-up ngoài và nguồn logic của BMS. Cảnh báo `GPIO ... maybe conflict with others` là reservation phần mềm; chọn hai GPIO chưa được dùng và đặt `BMS_SDA_GPIO_NUM`, `BMS_SCL_GPIO_NUM`, `BMS_I2C_PORT_NUM` trong `platformio.ini` nếu board của bạn dùng GPIO21/22 cho phần cứng khác. Pull-up nội chỉ là phép thử ngắn sau khi xác nhận bus an toàn ở 3,3 V.
+
 | Lệnh UART | Chức năng |
 | --- | --- |
 | `help` | In danh sách lệnh. |

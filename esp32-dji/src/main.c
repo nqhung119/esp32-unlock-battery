@@ -5,7 +5,9 @@
 #include <string.h>
 #include <strings.h>
 
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -21,8 +23,24 @@
  * connection. All write commands require an explicit UART confirmation.
  */
 
-#define BMS_SDA_GPIO             GPIO_NUM_21
-#define BMS_SCL_GPIO             GPIO_NUM_22
+#ifndef BMS_SDA_GPIO_NUM
+#define BMS_SDA_GPIO_NUM         21
+#endif
+
+#ifndef BMS_SCL_GPIO_NUM
+#define BMS_SCL_GPIO_NUM         22
+#endif
+
+#ifndef BMS_I2C_PORT_NUM
+#define BMS_I2C_PORT_NUM         0
+#endif
+
+#ifndef BMS_ENABLE_INTERNAL_PULLUPS
+#define BMS_ENABLE_INTERNAL_PULLUPS 0
+#endif
+
+#define BMS_SDA_GPIO             ((gpio_num_t)BMS_SDA_GPIO_NUM)
+#define BMS_SCL_GPIO             ((gpio_num_t)BMS_SCL_GPIO_NUM)
 #define BMS_ADDRESS              0x0B
 #define BMS_CLOCK_HZ             50000
 #define BMS_TIMEOUT_MS           100
@@ -124,12 +142,12 @@ static void log_ascii(const char *label, const uint8_t *data, size_t length)
 static esp_err_t bms_i2c_init(void)
 {
     i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = I2C_NUM_0,
+        .i2c_port = BMS_I2C_PORT_NUM,
         .sda_io_num = BMS_SDA_GPIO,
         .scl_io_num = BMS_SCL_GPIO,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = false,
+        .flags.enable_internal_pullup = BMS_ENABLE_INTERNAL_PULLUPS,
     };
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &g_i2c_bus), TAG, "create I2C bus");
 
@@ -140,6 +158,17 @@ static esp_err_t bms_i2c_init(void)
         .flags.disable_ack_check = false,
     };
     return i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &g_bms);
+}
+
+static void bms_log_line_levels(void)
+{
+    const int sda = gpio_get_level(BMS_SDA_GPIO);
+    const int scl = gpio_get_level(BMS_SCL_GPIO);
+
+    ESP_LOGI(TAG, "I2C idle levels: SDA=%d SCL=%d", sda, scl);
+    if (sda != 1 || scl != 1) {
+        ESP_LOGE(TAG, "I2C bus is not idle-high; check wiring, pull-ups and BMS logic power");
+    }
 }
 
 static esp_err_t bms_probe(void)
@@ -454,6 +483,7 @@ static void bms_log_full_dump(void)
     ESP_LOGI(TAG, "========== BMS FULL DUMP START ==========");
     ESP_LOGI(TAG, "Target=BQ30Z554-R1, address=0x%02X, I2C=%u Hz, SDA=%d, SCL=%d",
              BMS_ADDRESS, BMS_CLOCK_HZ, BMS_SDA_GPIO, BMS_SCL_GPIO);
+    bms_log_line_levels();
     if (bms_probe() != ESP_OK) {
         ESP_LOGE(TAG, "No ACK from BMS at 0x%02X; check wiring and voltage level", BMS_ADDRESS);
         return;
@@ -664,19 +694,52 @@ static void handle_command(char *line)
     xSemaphoreGive(g_bms_lock);
 }
 
+static esp_err_t console_uart_init(void)
+{
+    if (uart_is_driver_installed(UART_NUM_0)) {
+        return ESP_OK;
+    }
+
+    /* UART0 pins and baud rate are already configured by the ESP-IDF console. */
+    return uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
+}
+
 static void console_task(void *argument)
 {
     char line[96];
+    size_t length = 0;
     (void)argument;
 
+    printf("bms> ");
+    fflush(stdout);
     while (true) {
-        printf("bms> ");
-        fflush(stdout);
-        if (fgets(line, sizeof(line), stdin) == NULL) {
-            vTaskDelay(pdMS_TO_TICKS(100));
+        uint8_t character;
+        const int received = uart_read_bytes(UART_NUM_0, &character, 1, portMAX_DELAY);
+        if (received != 1) {
             continue;
         }
-        handle_command(line);
+
+        if (character == '\r' || character == '\n') {
+            if (length == 0) {
+                continue;
+            }
+            line[length] = '\0';
+            printf("\r\n");
+            handle_command(line);
+            length = 0;
+            printf("bms> ");
+            fflush(stdout);
+        } else if ((character == '\b' || character == 0x7F) && length > 0) {
+            --length;
+            printf("\b \b");
+            fflush(stdout);
+        } else if (character >= 32 && character <= 126) {
+            if (length < sizeof(line) - 1) {
+                line[length++] = (char)character;
+                putchar(character);
+                fflush(stdout);
+            }
+        }
     }
 }
 
@@ -716,6 +779,11 @@ void app_main(void)
     }
 
     print_help();
+    err = console_uart_init();
+    if (err != ESP_OK) {
+        log_error("UART console initialization", err);
+        return;
+    }
     xTaskCreate(console_task, "bms_console", 4096, NULL, 5, NULL);
     xTaskCreate(monitor_task, "bms_monitor", 4096, NULL, 4, NULL);
 }
