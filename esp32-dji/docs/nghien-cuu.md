@@ -10,6 +10,10 @@ Ghi log → Unseal bằng SHA-1 challenge/response → Full Access
 → đọc lại trạng thái → Seal lại
 ```
 
+ESP32 giữ SCL tối đa 12 ms cho mỗi phase của giao dịch. Giá trị này thay thế
+default 2 ms của ESP-IDF, vì BQ30Z554 có thể clock-stretch khi nhận block
+`ManufacturerInput` 20 byte trong SHA-1 authentication.
+
 Chuỗi này bám theo quy trình trong bài [Make a custom battery for DJI Mavic Pro](https://ludovic.cool/make-a-custom-battery-for-dji-mavic-pro/) nhưng thay Raspberry Pi bằng ESP32. Mã lệnh, định dạng SHA-1 và thời gian chờ được đối chiếu với [BQ30Z554-R1 Technical Reference Manual của TI](https://www.ti.com/lit/pdf/sluua79) và định nghĩa BQ30Z554 của [O-GS dji-firmware-tools](https://github.com/o-gs/dji-firmware-tools).
 
 ## Xác nhận IC

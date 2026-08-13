@@ -41,11 +41,20 @@
 #define BMS_ENABLE_INTERNAL_PULLUPS 0
 #endif
 
+/*
+ * BQ30Z554 may stretch SCL while it processes a ManufacturerInput block.
+ * ESP-IDF defaults this per-clock timeout to 2 ms on the classic ESP32,
+ * which is too short for the 20-byte SHA-1 response transaction.
+ */
+#ifndef BMS_SCL_WAIT_US
+#define BMS_SCL_WAIT_US          12000
+#endif
+
 #define BMS_SDA_GPIO             ((gpio_num_t)BMS_SDA_GPIO_NUM)
 #define BMS_SCL_GPIO             ((gpio_num_t)BMS_SCL_GPIO_NUM)
 #define BMS_ADDRESS              0x0B
 #define BMS_CLOCK_HZ             50000
-#define BMS_TIMEOUT_MS           100
+#define BMS_TIMEOUT_MS           500
 #define BMS_MFG_SELECT_WAIT_MS   10
 #define BMS_UNSEAL_WAIT_MS       250
 #define BMS_MONITOR_PERIOD_MS    2000
@@ -188,6 +197,7 @@ static esp_err_t bms_i2c_init(void)
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = BMS_ADDRESS,
         .scl_speed_hz = BMS_CLOCK_HZ,
+        .scl_wait_us = BMS_SCL_WAIT_US,
         .flags.disable_ack_check = false,
     };
     return i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &g_bms);
@@ -550,8 +560,9 @@ static void bms_log_full_dump(void)
     uint32_t ignored_op;
 
     ESP_LOGI(TAG, "========== BMS FULL DUMP START ==========");
-    ESP_LOGI(TAG, "Target=BQ30Z554-R1, address=0x%02X, I2C=%u Hz, SDA=%d, SCL=%d",
-             BMS_ADDRESS, BMS_CLOCK_HZ, BMS_SDA_GPIO, BMS_SCL_GPIO);
+    ESP_LOGI(TAG,
+             "Target=BQ30Z554-R1, address=0x%02X, I2C=%u Hz, SCL wait=%u us, SDA=%d, SCL=%d",
+             BMS_ADDRESS, BMS_CLOCK_HZ, BMS_SCL_WAIT_US, BMS_SDA_GPIO, BMS_SCL_GPIO);
     bms_log_line_levels();
     if (bms_probe() != ESP_OK) {
         ESP_LOGE(TAG, "No ACK from BMS at 0x%02X; check wiring and voltage level", BMS_ADDRESS);
