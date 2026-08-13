@@ -58,8 +58,12 @@
 #define BMS_SDA_GPIO             ((gpio_num_t)BMS_SDA_GPIO_NUM)
 #define BMS_SCL_GPIO             ((gpio_num_t)BMS_SCL_GPIO_NUM)
 #define BMS_ADDRESS              0x0B
-#define BMS_CLOCK_HZ             50000
+#ifndef BMS_CLOCK_HZ
+#define BMS_CLOCK_HZ             10000
+#endif
 #define BMS_TIMEOUT_MS           500
+#define BMS_PROBE_ATTEMPTS       4
+#define BMS_PROBE_RETRY_WAIT_MS  50
 #define BMS_MFG_SELECT_WAIT_MS   10
 #define BMS_UNSEAL_WAIT_MS       250
 #define BMS_MONITOR_PERIOD_MS    2000
@@ -252,7 +256,28 @@ static void bms_log_line_levels(void)
 
 static esp_err_t bms_probe(void)
 {
-    return i2c_master_probe(g_i2c_bus, BMS_ADDRESS, BMS_TIMEOUT_MS);
+    esp_err_t err = ESP_FAIL;
+
+    for (unsigned int attempt = 1; attempt <= BMS_PROBE_ATTEMPTS; ++attempt) {
+        err = i2c_master_probe(g_i2c_bus, BMS_ADDRESS, BMS_TIMEOUT_MS);
+        if (err == ESP_OK) {
+            if (attempt > 1) {
+                ESP_LOGW(TAG, "BMS ACK recovered on probe attempt %u/%u", attempt,
+                         BMS_PROBE_ATTEMPTS);
+            }
+            return ESP_OK;
+        }
+        if (attempt < BMS_PROBE_ATTEMPTS) {
+            ESP_LOGW(TAG, "BMS probe attempt %u/%u failed (%s); resetting I2C bus",
+                     attempt, BMS_PROBE_ATTEMPTS, esp_err_to_name(err));
+            const esp_err_t reset_err = i2c_master_bus_reset(g_i2c_bus);
+            if (reset_err != ESP_OK) {
+                log_error("I2C bus recovery", reset_err);
+            }
+            vTaskDelay(pdMS_TO_TICKS(BMS_PROBE_RETRY_WAIT_MS));
+        }
+    }
+    return err;
 }
 
 static esp_err_t bms_read_word(uint8_t command, uint16_t *value)
@@ -598,8 +623,8 @@ static void bms_log_measurements(bool include_extended)
 
 static void bms_log_snapshot(void)
 {
-    uint32_t pf_status = 0;
-    uint32_t operation_status = 0;
+    uint32_t pf_status = UINT32_MAX;
+    uint32_t operation_status = UINT32_MAX;
 
     ESP_LOGI(TAG, "===== BMS SNAPSHOT START =====");
     if (bms_probe() != ESP_OK) {
@@ -608,8 +633,12 @@ static void bms_log_snapshot(void)
     }
     bms_log_status_group(&pf_status, &operation_status);
     bms_log_standard_words();
-    ESP_LOGI(TAG, "Snapshot summary: PF=0x%08" PRIX32 ", security=%s", pf_status,
-             bms_security_state_name(operation_status));
+    if (pf_status == UINT32_MAX || operation_status == UINT32_MAX) {
+        ESP_LOGW(TAG, "Snapshot summary unavailable: PFStatus or OperationStatus could not be read");
+    } else {
+        ESP_LOGI(TAG, "Snapshot summary: PF=0x%08" PRIX32 ", security=%s", pf_status,
+                 bms_security_state_name(operation_status));
+    }
     ESP_LOGI(TAG, "===== BMS SNAPSHOT END =====");
 }
 
