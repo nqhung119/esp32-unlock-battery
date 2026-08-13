@@ -50,9 +50,13 @@
 #define BMS_SCL_WAIT_US          12000
 #endif
 
-/* DJI's BQ30Z554 SMBus transport uses the optional SMBus PEC byte. */
+/*
+ * PEC is optional in SBS. This DJI BQ30Z554 board acknowledges standard SMBus
+ * traffic without host PEC; keep it opt-in for boards explicitly configured
+ * with the SBS Data HPE bit.
+ */
 #ifndef BMS_USE_PEC
-#define BMS_USE_PEC              1
+#define BMS_USE_PEC              0
 #endif
 
 #define BMS_SDA_GPIO             ((gpio_num_t)BMS_SDA_GPIO_NUM)

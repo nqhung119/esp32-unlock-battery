@@ -14,9 +14,9 @@ ESP32 giữ SCL tối đa 12 ms cho mỗi phase của giao dịch. Giá trị n�
 default 2 ms của ESP-IDF, vì BQ30Z554 có thể clock-stretch khi nhận block
 `ManufacturerInput` 20 byte trong SHA-1 authentication.
 
-Giao tiếp SMBus của board DJI dùng PEC (CRC-8, polynomial `0x07`). Firmware
-thêm và kiểm tra PEC cho mọi SMBus word/block; đây là điều kiện đặc biệt quan
-trọng đối với block response 20 byte của `ManufacturerInput()`.
+PEC là tuỳ chọn của SBS. Firmware có thể thêm/kiểm tra PEC (CRC-8,
+polynomial `0x07`) khi build với `BMS_USE_PEC=1`; nhưng board DJI này được
+quan sát giao tiếp ổn định với host PEC tắt, nên cấu hình mặc định là `0`.
 
 Firmware retry probe kèm I2C bus recovery khi SMBus không ổn định. Pull-up nội
 bộ ESP32 chỉ là chế độ chẩn đoán tùy chọn; pull-up ngoài phù hợp vẫn cần thiết
