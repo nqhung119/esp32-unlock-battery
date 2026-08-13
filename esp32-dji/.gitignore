@@ -1,0 +1,17 @@
+# PlatformIO build products and dependency caches
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE-specific workspace state
+.vscode/
+
+# CMake files generated outside PlatformIO
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
