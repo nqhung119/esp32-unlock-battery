@@ -14,6 +14,10 @@ ESP32 giữ SCL tối đa 12 ms cho mỗi phase của giao dịch. Giá trị n�
 default 2 ms của ESP-IDF, vì BQ30Z554 có thể clock-stretch khi nhận block
 `ManufacturerInput` 20 byte trong SHA-1 authentication.
 
+Giao tiếp SMBus của board DJI dùng PEC (CRC-8, polynomial `0x07`). Firmware
+thêm và kiểm tra PEC cho mọi SMBus word/block; đây là điều kiện đặc biệt quan
+trọng đối với block response 20 byte của `ManufacturerInput()`.
+
 Chuỗi này bám theo quy trình trong bài [Make a custom battery for DJI Mavic Pro](https://ludovic.cool/make-a-custom-battery-for-dji-mavic-pro/) nhưng thay Raspberry Pi bằng ESP32. Mã lệnh, định dạng SHA-1 và thời gian chờ được đối chiếu với [BQ30Z554-R1 Technical Reference Manual của TI](https://www.ti.com/lit/pdf/sluua79) và định nghĩa BQ30Z554 của [O-GS dji-firmware-tools](https://github.com/o-gs/dji-firmware-tools).
 
 ## Xác nhận IC

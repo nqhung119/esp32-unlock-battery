@@ -50,6 +50,11 @@
 #define BMS_SCL_WAIT_US          12000
 #endif
 
+/* DJI's BQ30Z554 SMBus transport uses the optional SMBus PEC byte. */
+#ifndef BMS_USE_PEC
+#define BMS_USE_PEC              1
+#endif
+
 #define BMS_SDA_GPIO             ((gpio_num_t)BMS_SDA_GPIO_NUM)
 #define BMS_SCL_GPIO             ((gpio_num_t)BMS_SCL_GPIO_NUM)
 #define BMS_ADDRESS              0x0B
@@ -157,6 +162,37 @@ static uint32_t le32(const uint8_t *data)
            ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
 }
 
+#if BMS_USE_PEC
+static uint8_t bms_pec_update(uint8_t crc, uint8_t value)
+{
+    crc ^= value;
+    for (unsigned int bit = 0; bit < 8; ++bit) {
+        crc = (crc & 0x80U) ? (uint8_t)((crc << 1) ^ 0x07U) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
+static uint8_t bms_write_pec(const uint8_t *frame, size_t length)
+{
+    uint8_t crc = bms_pec_update(0, (uint8_t)(BMS_ADDRESS << 1));
+    for (size_t i = 0; i < length; ++i) {
+        crc = bms_pec_update(crc, frame[i]);
+    }
+    return crc;
+}
+
+static uint8_t bms_read_pec(uint8_t command, const uint8_t *data, size_t length)
+{
+    uint8_t crc = bms_pec_update(0, (uint8_t)(BMS_ADDRESS << 1));
+    crc = bms_pec_update(crc, command);
+    crc = bms_pec_update(crc, (uint8_t)((BMS_ADDRESS << 1) | 1U));
+    for (size_t i = 0; i < length; ++i) {
+        crc = bms_pec_update(crc, data[i]);
+    }
+    return crc;
+}
+#endif
+
 static void log_error(const char *operation, esp_err_t err)
 {
     ESP_LOGW(TAG, "%s failed: %s (0x%x)", operation, esp_err_to_name(err), err);
@@ -221,18 +257,28 @@ static esp_err_t bms_probe(void)
 
 static esp_err_t bms_read_word(uint8_t command, uint16_t *value)
 {
-    uint8_t rx[2];
+    uint8_t rx[2 + BMS_USE_PEC];
     esp_err_t err = i2c_master_transmit_receive(
         g_bms, &command, 1, rx, sizeof(rx), BMS_TIMEOUT_MS);
-    if (err == ESP_OK) {
-        *value = le16(rx);
+    if (err != ESP_OK) {
+        return err;
     }
-    return err;
+#if BMS_USE_PEC
+    if (rx[2] != bms_read_pec(command, rx, 2)) {
+        ESP_LOGE(TAG, "PEC mismatch while reading word 0x%02X", command);
+        return ESP_ERR_INVALID_CRC;
+    }
+#endif
+    *value = le16(rx);
+    return ESP_OK;
 }
 
 static esp_err_t bms_write_word(uint8_t command, uint16_t value)
 {
-    const uint8_t tx[] = {command, (uint8_t)value, (uint8_t)(value >> 8)};
+    uint8_t tx[3 + BMS_USE_PEC] = {command, (uint8_t)value, (uint8_t)(value >> 8)};
+#if BMS_USE_PEC
+    tx[3] = bms_write_pec(tx, 3);
+#endif
     return i2c_master_transmit(g_bms, tx, sizeof(tx), BMS_TIMEOUT_MS);
 }
 
@@ -240,13 +286,13 @@ static esp_err_t bms_write_word(uint8_t command, uint16_t value)
 static esp_err_t bms_read_block_exact(uint8_t command, uint8_t *payload,
                                       size_t expected_length)
 {
-    uint8_t rx[33];
+    uint8_t rx[33 + BMS_USE_PEC];
     if (expected_length > 32) {
         return ESP_ERR_INVALID_SIZE;
     }
 
     esp_err_t err = i2c_master_transmit_receive(
-        g_bms, &command, 1, rx, expected_length + 1, BMS_TIMEOUT_MS);
+        g_bms, &command, 1, rx, expected_length + 1 + BMS_USE_PEC, BMS_TIMEOUT_MS);
     if (err != ESP_OK) {
         return err;
     }
@@ -255,6 +301,12 @@ static esp_err_t bms_read_block_exact(uint8_t command, uint8_t *payload,
                  rx[0], (unsigned)expected_length);
         return ESP_ERR_INVALID_RESPONSE;
     }
+#if BMS_USE_PEC
+    if (rx[expected_length + 1] != bms_read_pec(command, rx, expected_length + 1)) {
+        ESP_LOGE(TAG, "PEC mismatch while reading block 0x%02X", command);
+        return ESP_ERR_INVALID_CRC;
+    }
+#endif
 
     memcpy(payload, &rx[1], expected_length);
     return ESP_OK;
@@ -263,7 +315,7 @@ static esp_err_t bms_read_block_exact(uint8_t command, uint8_t *payload,
 static esp_err_t bms_write_block(uint8_t command, const uint8_t *payload,
                                  size_t length)
 {
-    uint8_t tx[34];
+    uint8_t tx[34 + BMS_USE_PEC];
     if (length > 32) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -271,7 +323,10 @@ static esp_err_t bms_write_block(uint8_t command, const uint8_t *payload,
     tx[0] = command;
     tx[1] = (uint8_t)length;
     memcpy(&tx[2], payload, length);
-    return i2c_master_transmit(g_bms, tx, length + 2, BMS_TIMEOUT_MS);
+#if BMS_USE_PEC
+    tx[length + 2] = bms_write_pec(tx, length + 2);
+#endif
+    return i2c_master_transmit(g_bms, tx, length + 2 + BMS_USE_PEC, BMS_TIMEOUT_MS);
 }
 
 static esp_err_t bms_read_mfg(uint16_t subcommand, uint8_t *payload,
@@ -307,18 +362,22 @@ static bool bms_security_is_full_access(uint32_t operation_status)
     return sec1 == 0 && sec0 == 0;
 }
 
-static const char *bms_security_state_name(uint32_t operation_status)
+static bool bms_security_is_sealed(uint32_t operation_status)
 {
     const uint8_t sec0 = (operation_status >> 8) & 1U;
     const uint8_t sec1 = (operation_status >> 9) & 1U;
+    return sec1 == 1 && sec0 == 1;
+}
 
+static const char *bms_security_state_name(uint32_t operation_status)
+{
     if (bms_security_is_full_access(operation_status)) {
         return "FULL-ACCESS";
     }
     if (bms_security_is_unsealed(operation_status)) {
         return "UNSEALED";
     }
-    return (sec1 == 1 && sec0 == 1) ? "SEALED" : "UNKNOWN";
+    return bms_security_is_sealed(operation_status) ? "SEALED" : "UNKNOWN";
 }
 
 static void bms_log_operation_status(uint32_t value)
@@ -561,8 +620,8 @@ static void bms_log_full_dump(void)
 
     ESP_LOGI(TAG, "========== BMS FULL DUMP START ==========");
     ESP_LOGI(TAG,
-             "Target=BQ30Z554-R1, address=0x%02X, I2C=%u Hz, SCL wait=%u us, SDA=%d, SCL=%d",
-             BMS_ADDRESS, BMS_CLOCK_HZ, BMS_SCL_WAIT_US, BMS_SDA_GPIO, BMS_SCL_GPIO);
+             "Target=BQ30Z554-R1, address=0x%02X, I2C=%u Hz, PEC=%u, SCL wait=%u us, SDA=%d, SCL=%d",
+             BMS_ADDRESS, BMS_CLOCK_HZ, BMS_USE_PEC, BMS_SCL_WAIT_US, BMS_SDA_GPIO, BMS_SCL_GPIO);
     bms_log_line_levels();
     if (bms_probe() != ESP_OK) {
         ESP_LOGE(TAG, "No ACK from BMS at 0x%02X; check wiring and voltage level", BMS_ADDRESS);
@@ -671,6 +730,35 @@ static esp_err_t bms_seal(void)
         ESP_LOGI(TAG, "Seal command sent");
     }
     return err;
+}
+
+/* Align console state with the BQ state in case the ESP32 was reset mid-session. */
+static esp_err_t bms_sync_security_session(void)
+{
+    uint32_t operation_status;
+    ESP_RETURN_ON_ERROR(bms_read_mfg_u32(MA_OPERATION_STATUS, &operation_status), TAG,
+                        "read operation status before commissioning");
+    bms_log_operation_status(operation_status);
+
+    if (bms_security_is_full_access(operation_status)) {
+        g_unsealed_session = true;
+        g_full_access_session = true;
+        ESP_LOGW(TAG, "BQ already reports FULL ACCESS; authentication step will be skipped");
+        return ESP_OK;
+    }
+    if (bms_security_is_unsealed(operation_status)) {
+        g_unsealed_session = true;
+        g_full_access_session = false;
+        ESP_LOGW(TAG, "BQ already reports UNSEALED; only Full Access authentication is required");
+        return ESP_OK;
+    }
+    if (bms_security_is_sealed(operation_status)) {
+        g_unsealed_session = false;
+        g_full_access_session = false;
+        return ESP_OK;
+    }
+
+    return ESP_ERR_INVALID_STATE;
 }
 
 typedef struct {
@@ -1119,15 +1207,24 @@ static void bms_run_commission(const bms_profile_t *profile)
              profile->capacity_mah, profile->nominal_voltage_mv, profile->low_temp_charge_mv,
              profile->standard_temp_charge_mv, profile->high_temp_charge_mv, profile->rec_temp_charge_mv);
     bms_log_full_dump();
-    err = bms_unseal();
+    err = bms_sync_security_session();
     if (err != ESP_OK) {
-        log_error("unseal for commissioning", err);
+        log_error("sync security state for commissioning", err);
         goto reseal;
     }
-    err = bms_full_access();
-    if (err != ESP_OK) {
-        log_error("full access for commissioning", err);
-        goto reseal;
+    if (!g_unsealed_session) {
+        err = bms_unseal();
+        if (err != ESP_OK) {
+            log_error("unseal for commissioning", err);
+            goto reseal;
+        }
+    }
+    if (!g_full_access_session) {
+        err = bms_full_access();
+        if (err != ESP_OK) {
+            log_error("full access for commissioning", err);
+            goto reseal;
+        }
     }
     err = bms_apply_profile(profile);
     if (err != ESP_OK) {
