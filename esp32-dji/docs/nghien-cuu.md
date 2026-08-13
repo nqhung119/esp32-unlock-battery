@@ -18,9 +18,9 @@ Giao tiếp SMBus của board DJI dùng PEC (CRC-8, polynomial `0x07`). Firmware
 thêm và kiểm tra PEC cho mọi SMBus word/block; đây là điều kiện đặc biệt quan
 trọng đối với block response 20 byte của `ManufacturerInput()`.
 
-Khi đường SMBus chỉ có pull-up nội bộ ESP32, firmware dùng 10 kHz và retry
-probe kèm I2C bus recovery. Đây chỉ là chế độ chẩn đoán cho bus không ổn định;
-pull-up ngoài phù hợp vẫn cần thiết để giao tiếp bền vững.
+Firmware retry probe kèm I2C bus recovery khi SMBus không ổn định. Pull-up nội
+bộ ESP32 chỉ là chế độ chẩn đoán tùy chọn; pull-up ngoài phù hợp vẫn cần thiết
+để giao tiếp bền vững.
 
 Chuỗi này bám theo quy trình trong bài [Make a custom battery for DJI Mavic Pro](https://ludovic.cool/make-a-custom-battery-for-dji-mavic-pro/) nhưng thay Raspberry Pi bằng ESP32. Mã lệnh, định dạng SHA-1 và thời gian chờ được đối chiếu với [BQ30Z554-R1 Technical Reference Manual của TI](https://www.ti.com/lit/pdf/sluua79) và định nghĩa BQ30Z554 của [O-GS dji-firmware-tools](https://github.com/o-gs/dji-firmware-tools).
 

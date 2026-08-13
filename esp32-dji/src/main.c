@@ -59,7 +59,7 @@
 #define BMS_SCL_GPIO             ((gpio_num_t)BMS_SCL_GPIO_NUM)
 #define BMS_ADDRESS              0x0B
 #ifndef BMS_CLOCK_HZ
-#define BMS_CLOCK_HZ             10000
+#define BMS_CLOCK_HZ             50000
 #endif
 #define BMS_TIMEOUT_MS           500
 #define BMS_PROBE_ATTEMPTS       4
