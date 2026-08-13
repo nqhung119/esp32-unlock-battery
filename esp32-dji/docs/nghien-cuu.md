@@ -5,8 +5,9 @@
 Firmware mục tiêu của dự án là **BQ30Z554-R1** tại địa chỉ SMBus 7-bit `0x0B`, dùng ESP32 DevKit với ESP-IDF 5.5.3. Ngoài các thao tác đọc chẩn đoán, firmware phải hỗ trợ đúng chuỗi thao tác sau:
 
 ```text
-Ghi log → Unseal bằng SHA-1 challenge/response → xác minh Unsealed
-→ Permanent Fail Data Reset → đọc lại trạng thái → Seal lại
+Ghi log → Unseal bằng SHA-1 challenge/response → Full Access
+→ backup Data Flash → ghi/verify profile cell mới → Permanent Fail Data Reset
+→ đọc lại trạng thái → Seal lại
 ```
 
 Chuỗi này bám theo quy trình trong bài [Make a custom battery for DJI Mavic Pro](https://ludovic.cool/make-a-custom-battery-for-dji-mavic-pro/) nhưng thay Raspberry Pi bằng ESP32. Mã lệnh, định dạng SHA-1 và thời gian chờ được đối chiếu với [BQ30Z554-R1 Technical Reference Manual của TI](https://www.ti.com/lit/pdf/sluua79) và định nghĩa BQ30Z554 của [O-GS dji-firmware-tools](https://github.com/o-gs/dji-firmware-tools).
@@ -32,7 +33,7 @@ Pin Mavic Pro là pack Li-Po HV 3S. Việc pin hiện khó hoặc không còn mu
 - Tháo pin khỏi drone, bộ sạc và tải. Làm việc trên bề mặt không cháy; không để pack đang thử nghiệm không giám sát.
 - Trước khi reset PF, phải xử lý nguyên nhân gốc: cell suy giảm/mất cân bằng, NTC, FET, cầu chì, đường đo cell hoặc bo AFE. TI nêu rõ PF có thể do điện áp, dòng, nhiệt độ, FET, thermistor, cầu chì, AFE hoặc Data Flash.
 - Sao lưu toàn bộ log `PFStatus`, `SafetyStatus`, điện áp cell, nhiệt độ, điện áp pack và ảnh hiện trạng **trước** khi reset. Lệnh `0x0029` sẽ xoá dữ liệu PF, làm mất bằng chứng chẩn đoán đó.
-- Không thay DesignCapacity, DesignVoltage, Data Flash, số chu kỳ, key bảo mật, calibration hoặc điều khiển FET thủ công trong dự án này.
+- Chỉ transaction `commission` mới được phép sửa Data Flash; nó chỉ cập nhật các trường capacity, nominal voltage, charge voltage theo nhiệt độ và COV. Không ghi số chu kỳ, key bảo mật, calibration, ChemID hoặc điều khiển FET thủ công.
 - Sau khi unseal, luôn chạy `Seal` trong `finally`/nhánh dọn dẹp, kể cả khi PF reset thất bại.
 
 Không reset khi `PFStatus` cho thấy lỗi cầu chì, PTC, AFE/AFE communication, Instruction Flash checksum hoặc Data Flash write fail; các lỗi này không được coi là lỗi cell thông thường. Một số điều kiện, như PTC, yêu cầu chu kỳ cấp nguồn hoàn chỉnh; nếu điều kiện lỗi còn tồn tại thì cờ PF sẽ lập lại ngay sau khi reset. [Chi tiết PF của TI](https://www.ti.com/lit/pdf/sluua79)
@@ -69,7 +70,7 @@ FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.*)
 
 idf_component_register(
     SRCS ${app_sources}
-    REQUIRES esp_driver_i2c mbedtls
+    REQUIRES esp_driver_gpio esp_driver_i2c esp_driver_uart mbedtls
 )
 ```
 
@@ -280,11 +281,39 @@ Nếu boot log báo `I2C idle levels: SDA=0` hoặc `SCL=0`, bus đang bị kéo
 | `snapshot` | Log trạng thái cốt lõi SBS/BQ30. |
 | `dump` | Log đầy đủ raw block, trạng thái PF, điện áp/nhiệt độ, lifetime và Impedance Track. |
 | `watch on` / `watch off` | Bật/tắt snapshot mỗi 2 giây. |
+| `profile show` | Đọc `BatteryMode` và năm Data Flash row dùng cho commissioning; chỉ đọc, in raw backup và giá trị giải mã. |
+| `commission <mAh> <nominal-mV> <low-mV> <std-mV> <high-mV> <rec-mV> CONFIRM` | Transaction khép kín: unseal, Full Access, backup/ghi/verify profile, xoá CUDEP-only PF, seal và snapshot cuối. |
 | `unseal CONFIRM` | Chạy SHA-1 challenge/response với candidate key cấu hình sẵn. |
-| `pf-reset CONFIRM` | Chỉ reset PF trong session đã unseal; firmware luôn gửi Seal sau đó. |
+| `pf-reset CONFIRM` | Chỉ reset `PFStatus = 0x00000004` (CUDEP-only) trong session đã unseal; firmware luôn gửi Seal sau đó. |
 | `seal CONFIRM` | Gửi Seal ngay và kết thúc session ghi. |
 
-Các lệnh ghi không tự chạy khi khởi động. Firmware từ chối `pf-reset` nếu chưa unseal hoặc nếu `PFStatus` chứa cờ nghiêm trọng như copper deposition, thermistor, cầu chì, AFE, PTC, Instruction Flash, Open VCx hoặc Data Flash write failure. Cả giá trị raw lẫn giải mã PF/OperationStatus đều được in UART để lưu bằng chứng trước và sau thao tác.
+### Commissioning pack cell mới
+
+`commission` nhận capacity theo mAh, điện áp danh định của *cả pack* theo mV, rồi bốn điện áp sạc theo cell ở các dải nhiệt độ `low / standard / high / recommended`. Mọi giá trị được nhập tường minh thay vì hard-code một loại cell.
+
+Ví dụ cú pháp (các số chỉ là vị trí tham số, không phải profile mặc định):
+
+```text
+commission <mAh> <nominal-mV> <low-mV> <std-mV> <high-mV> <rec-mV> CONFIRM
+```
+
+Firmware giới hạn `mAh` từ 100 đến 32767, nominal voltage từ 6000 đến 18000 mV và mỗi charge voltage từ 2500 đến 4350 mV. Nó tính tự động `DesignCapacity` ở hai dạng: mAh và `10 mWh` (`mAh × nominal-mV / 10000`, làm tròn gần nhất). Bit `CAPM` trong `BatteryMode()` được giữ nguyên; do đó `DesignCapacity()` sẽ report đúng theo mode của pack.
+
+Theo Table 11-1 của TI, transaction backup toàn bộ năm row Data Flash `0x03`, `0x04`, `0x08`, `0x0F`, `0x10`; rồi chỉ sửa các trường sau và đọc lại từng row để verify:
+
+- SBS Data: `DesignVoltage`, `DesignCapacity` mAh và `DesignCapacity` 10 mWh.
+- Advanced Charging Algorithm: low, standard, high và recommended temperature charging voltage.
+- Protections:COV: cả bốn threshold và recovery. Firmware đặt threshold cao hơn charge voltage lớn nhất 50 mV và recovery thấp hơn 50 mV.
+
+`DesignCapacity` 10 mWh bắt đầu tại byte cuối row `0x0F`, vì vậy firmware luôn đọc/ghi cả row `0x0F` lẫn `0x10`. Giá trị Data Flash `I2` được lưu little-endian; SMBus word cũng truyền LSB trước. [TI Appendix B: Reading and Writing to Data Flash](https://www.ti.com/lit/pdf/sluua79)
+
+Ghi Data Flash cần **Full Access** sau Unseal. Nếu SHA-1 key được cấu hình không mở được `SEC1/SEC0 = 00`, firmware dừng trước bất kỳ lệnh ghi nào và Seal lại. Sau mỗi row write lỗi hoặc verify mismatch, firmware cố gửi lại backup của các row đã chạm rồi Seal. TI cũng lưu ý rằng DF write failure sẽ latch PF và cấm ghi tiếp. [TI: Data Flash Permanent Fail](https://www.ti.com/lit/pdf/sluua79)
+
+Transaction chỉ tiếp tục khi `PFStatus` bằng `0` hoặc chỉ có `CUDEP` (`0x00000004`). Với CUDEP-only, firmware ghi profile trước, gửi `MA 0x0029`, yêu cầu `PFStatus=0` khi đọc lại, rồi Seal. Các cờ fuse, AFE, PTC, instruction flash, Open VCx và Data Flash failure vẫn bị từ chối.
+
+Việc commission không thay ChemID, table Impedance Track hay QMax đã học từ cell cũ. Sau khi `PF=0` và BMS sealed, cần thực hiện chu kỳ học gauge phù hợp với chemistry mới để `FullChargeCapacity` và % pin hội tụ. [TI: điều kiện QMax update](https://www.ti.com/lit/pdf/sluua79)
+
+Các lệnh ghi không tự chạy khi khởi động. Cả giá trị raw lẫn giải mã PF/OperationStatus đều được in UART để lưu bằng chứng trước và sau thao tác.
 
 ## Tài liệu đối chiếu
 

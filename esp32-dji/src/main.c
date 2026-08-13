@@ -1,7 +1,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
@@ -47,11 +49,14 @@
 #define BMS_MFG_SELECT_WAIT_MS   10
 #define BMS_UNSEAL_WAIT_MS       250
 #define BMS_MONITOR_PERIOD_MS    2000
+#define BMS_DF_WRITE_WAIT_MS     100
+#define BMS_DF_ROW_SIZE          32
 
 #define SBS_MANUFACTURER_ACCESS  0x00
 #define SBS_MANUFACTURER_DATA    0x23
 #define SBS_MANUFACTURER_INPUT   0x2F
 
+#define SBS_BATTERY_MODE          0x03
 #define SBS_TEMPERATURE          0x08
 #define SBS_VOLTAGE              0x09
 #define SBS_CURRENT              0x0A
@@ -85,9 +90,36 @@
 #define MA_PF_DATA_RESET         0x0029
 #define MA_SEAL                  0x0030
 #define MA_UNSEAL                0x0031
+#define MA_FULL_ACCESS           0x0032
 
-#define PF_BLOCKED_MASK (BIT(2) | BIT(18) | BIT(19) | BIT(20) | BIT(21) | \
-                         BIT(22) | BIT(23) | BIT(24) | BIT(25) | BIT(26))
+#define PF_CUDEP_MASK             BIT(2)
+#define PF_HARD_BLOCKED_MASK      (BIT(18) | BIT(19) | BIT(20) | BIT(21) | \
+                                  BIT(22) | BIT(23) | BIT(24) | BIT(25) | BIT(26))
+
+/* TI SLUUA79 Table 11-1: physical DF address is subclass ID + offset. */
+#define DF_SBS_DATA_SUBCLASS                  489
+#define DF_SBS_INITIAL_BATTERY_MODE_OFFSET      6
+#define DF_SBS_DESIGN_VOLTAGE_OFFSET             8
+#define DF_SBS_DESIGN_CAPACITY_MAH_OFFSET       20
+#define DF_SBS_DESIGN_CAPACITY_CWH_OFFSET       22
+
+#define DF_LOW_TEMP_CHARGING_SUBCLASS          116
+#define DF_STANDARD_TEMP_CHARGING_SUBCLASS     124
+#define DF_HIGH_TEMP_CHARGING_SUBCLASS         132
+#define DF_REC_TEMP_CHARGING_SUBCLASS          140
+#define DF_CHARGING_VOLTAGE_OFFSET               0
+
+#define DF_COV_SUBCLASS                         267
+#define DF_COV_THRESHOLD_LOW_OFFSET               0
+#define DF_COV_THRESHOLD_STANDARD_OFFSET          2
+#define DF_COV_THRESHOLD_HIGH_OFFSET              4
+#define DF_COV_THRESHOLD_REC_OFFSET               6
+#define DF_COV_RECOVERY_LOW_OFFSET                 9
+#define DF_COV_RECOVERY_STANDARD_OFFSET           11
+#define DF_COV_RECOVERY_HIGH_OFFSET               13
+#define DF_COV_RECOVERY_REC_OFFSET                15
+
+#define BMS_COV_MARGIN_MV                         50
 
 static const char *TAG = "bms";
 
@@ -102,6 +134,7 @@ static i2c_master_dev_handle_t g_bms;
 static SemaphoreHandle_t g_bms_lock;
 static bool g_bms_ready;
 static bool g_unsealed_session;
+static bool g_full_access_session;
 static bool g_watch_enabled;
 
 static uint16_t le16(const uint8_t *data)
@@ -257,13 +290,32 @@ static bool bms_security_is_unsealed(uint32_t operation_status)
     return sec1 == 0 && sec0 == 1;
 }
 
+static bool bms_security_is_full_access(uint32_t operation_status)
+{
+    const uint8_t sec0 = (operation_status >> 8) & 1U;
+    const uint8_t sec1 = (operation_status >> 9) & 1U;
+    return sec1 == 0 && sec0 == 0;
+}
+
+static const char *bms_security_state_name(uint32_t operation_status)
+{
+    const uint8_t sec0 = (operation_status >> 8) & 1U;
+    const uint8_t sec1 = (operation_status >> 9) & 1U;
+
+    if (bms_security_is_full_access(operation_status)) {
+        return "FULL-ACCESS";
+    }
+    if (bms_security_is_unsealed(operation_status)) {
+        return "UNSEALED";
+    }
+    return (sec1 == 1 && sec0 == 1) ? "SEALED" : "UNKNOWN";
+}
+
 static void bms_log_operation_status(uint32_t value)
 {
     const uint8_t sec0 = (value >> 8) & 1U;
     const uint8_t sec1 = (value >> 9) & 1U;
-    const char *security = bms_security_is_unsealed(value) ? "UNSEALED" :
-                           (sec1 == 1 && sec0 == 1) ? "SEALED/FULL-ACCESS" :
-                           "UNKNOWN";
+    const char *security = bms_security_state_name(value);
 
     ESP_LOGI(TAG,
              "OperationStatus=0x%08" PRIX32 " SEC1=%u SEC0=%u (%s), PF=%u, DSG=%u, CHG=%u, XDSG=%u, XCHG=%u",
@@ -297,8 +349,12 @@ static void bms_log_pf_status(uint32_t value)
             ESP_LOGW(TAG, "PF bit %u active: %s", (unsigned)bit, names[bit]);
         }
     }
-    if ((value & PF_BLOCKED_MASK) != 0) {
+    if ((value & PF_HARD_BLOCKED_MASK) != 0) {
         ESP_LOGE(TAG, "PF reset is blocked: hardware/firmware integrity flag is active");
+    } else if (value == PF_CUDEP_MASK) {
+        ESP_LOGW(TAG, "PF contains CUDEP only; the commissioning transaction may clear this historical flag");
+    } else {
+        ESP_LOGE(TAG, "PF reset is blocked: flag set is not eligible for the CUDEP-only commissioning flow");
     }
 }
 
@@ -310,6 +366,7 @@ static void bms_log_standard_words(void)
     } word_command_t;
 
     static const word_command_t commands[] = {
+        {"BatteryMode", SBS_BATTERY_MODE},
         {"Temperature", SBS_TEMPERATURE},
         {"Voltage", SBS_VOLTAGE},
         {"Current", SBS_CURRENT},
@@ -323,6 +380,8 @@ static void bms_log_standard_words(void)
         {"DesignVoltage", SBS_DESIGN_VOLTAGE},
     };
 
+    bool capacity_mode = false;
+
     ESP_LOGI(TAG, "--- Standard SBS words ---");
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
         uint16_t value;
@@ -333,6 +392,12 @@ static void bms_log_standard_words(void)
         }
 
         switch (commands[i].command) {
+        case SBS_BATTERY_MODE:
+            capacity_mode = (value & BIT(15)) != 0;
+            ESP_LOGI(TAG, "%s: raw=0x%04X, CAPM=%u (%s)", commands[i].name,
+                     value, (unsigned)capacity_mode,
+                     capacity_mode ? "10mWh" : "mAh");
+            break;
         case SBS_TEMPERATURE:
             ESP_LOGI(TAG, "%s: raw=0x%04X, %.2f C", commands[i].name, value,
                      ((float)value / 10.0f) - 273.15f);
@@ -348,6 +413,10 @@ static void bms_log_standard_words(void)
             break;
         case SBS_RELATIVE_SOC:
             ESP_LOGI(TAG, "%s: raw=0x%04X, %u %%", commands[i].name, value, value);
+            break;
+        case SBS_DESIGN_CAPACITY:
+            ESP_LOGI(TAG, "%s: raw=0x%04X, %u %s", commands[i].name, value, value,
+                     capacity_mode ? "x 10mWh" : "mAh");
             break;
         default:
             ESP_LOGI(TAG, "%s: raw=0x%04X, %u", commands[i].name, value, value);
@@ -471,7 +540,7 @@ static void bms_log_snapshot(void)
     bms_log_status_group(&pf_status, &operation_status);
     bms_log_standard_words();
     ESP_LOGI(TAG, "Snapshot summary: PF=0x%08" PRIX32 ", security=%s", pf_status,
-             bms_security_is_unsealed(operation_status) ? "UNSEALED" : "NOT-UNSEALED");
+             bms_security_state_name(operation_status));
     ESP_LOGI(TAG, "===== BMS SNAPSHOT END =====");
 }
 
@@ -543,7 +612,42 @@ static esp_err_t bms_unseal(void)
     }
 
     g_unsealed_session = true;
-    ESP_LOGW(TAG, "BMS is UNSEALED. Run 'pf-reset CONFIRM' or 'seal CONFIRM'.");
+    g_full_access_session = false;
+    ESP_LOGW(TAG, "BMS is UNSEALED. Run 'pf-reset CONFIRM' (CUDEP only) or 'seal CONFIRM'.");
+    return ESP_OK;
+}
+
+static esp_err_t bms_full_access(void)
+{
+    uint8_t challenge[20];
+    uint8_t digest[20];
+    uint32_t operation_status;
+
+    if (!g_unsealed_session) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGW(TAG, "FULL ACCESS requested; starting SHA-1 challenge/response");
+    ESP_RETURN_ON_ERROR(bms_write_word(SBS_MANUFACTURER_ACCESS, MA_FULL_ACCESS), TAG,
+                        "start full access");
+    ESP_RETURN_ON_ERROR(bms_read_block_exact(SBS_MANUFACTURER_INPUT, challenge,
+                                              sizeof(challenge)), TAG, "read full access challenge");
+    log_hex("Full access challenge", challenge, sizeof(challenge));
+
+    bms_make_unseal_digest(k_ogs_default_unseal_key, challenge, digest);
+    ESP_RETURN_ON_ERROR(bms_write_block(SBS_MANUFACTURER_INPUT, digest, sizeof(digest)), TAG,
+                        "write full access response");
+    vTaskDelay(pdMS_TO_TICKS(BMS_UNSEAL_WAIT_MS));
+
+    ESP_RETURN_ON_ERROR(bms_read_mfg_u32(MA_OPERATION_STATUS, &operation_status), TAG,
+                        "read operation status after full access");
+    bms_log_operation_status(operation_status);
+    if (!bms_security_is_full_access(operation_status)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    g_full_access_session = true;
+    ESP_LOGW(TAG, "BMS is in FULL ACCESS. Data Flash writes are now permitted.");
     return ESP_OK;
 }
 
@@ -552,47 +656,489 @@ static esp_err_t bms_seal(void)
     esp_err_t err = bms_write_word(SBS_MANUFACTURER_ACCESS, MA_SEAL);
     if (err == ESP_OK) {
         g_unsealed_session = false;
+        g_full_access_session = false;
         ESP_LOGI(TAG, "Seal command sent");
     }
     return err;
 }
 
-static void bms_run_pf_reset(void)
+typedef struct {
+    uint16_t capacity_mah;
+    uint16_t nominal_voltage_mv;
+    uint16_t low_temp_charge_mv;
+    uint16_t standard_temp_charge_mv;
+    uint16_t high_temp_charge_mv;
+    uint16_t rec_temp_charge_mv;
+    uint16_t capacity_cwh;
+} bms_profile_t;
+
+typedef struct {
+    uint8_t row[5];
+    uint8_t original[5][BMS_DF_ROW_SIZE];
+    uint8_t updated[5][BMS_DF_ROW_SIZE];
+    bool dirty[5];
+} bms_df_image_t;
+
+static const uint8_t k_commission_rows[] = {3, 4, 8, 15, 16};
+
+static esp_err_t bms_df_select_row(uint8_t row)
+{
+    ESP_RETURN_ON_ERROR(bms_write_word(SBS_MANUFACTURER_ACCESS, (uint16_t)(0x0100U | row)),
+                        TAG, "select DF row 0x%02X", row);
+    vTaskDelay(pdMS_TO_TICKS(BMS_MFG_SELECT_WAIT_MS));
+    return ESP_OK;
+}
+
+static esp_err_t bms_df_read_row(uint8_t row, uint8_t data[BMS_DF_ROW_SIZE])
+{
+    ESP_RETURN_ON_ERROR(bms_df_select_row(row), TAG, "select DF row for read");
+    return bms_read_block_exact(SBS_MANUFACTURER_INPUT, data, BMS_DF_ROW_SIZE);
+}
+
+static esp_err_t bms_df_write_row(uint8_t row, const uint8_t data[BMS_DF_ROW_SIZE])
+{
+    ESP_RETURN_ON_ERROR(bms_df_select_row(row), TAG, "select DF row for write");
+    return bms_write_block(SBS_MANUFACTURER_INPUT, data, BMS_DF_ROW_SIZE);
+}
+
+static int bms_df_image_find_row(const bms_df_image_t *image, uint8_t row)
+{
+    for (size_t i = 0; i < sizeof(image->row) / sizeof(image->row[0]); ++i) {
+        if (image->row[i] == row) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static uint8_t *bms_df_image_byte(bms_df_image_t *image, uint16_t physical_address)
+{
+    const uint8_t row = (uint8_t)(physical_address / BMS_DF_ROW_SIZE);
+    const uint8_t offset = (uint8_t)(physical_address % BMS_DF_ROW_SIZE);
+    const int index = bms_df_image_find_row(image, row);
+
+    return index < 0 ? NULL : &image->updated[index][offset];
+}
+
+static const uint8_t *bms_df_image_const_byte(const bms_df_image_t *image,
+                                                uint16_t physical_address)
+{
+    const uint8_t row = (uint8_t)(physical_address / BMS_DF_ROW_SIZE);
+    const uint8_t offset = (uint8_t)(physical_address % BMS_DF_ROW_SIZE);
+    const int index = bms_df_image_find_row(image, row);
+
+    return index < 0 ? NULL : &image->updated[index][offset];
+}
+
+static esp_err_t bms_df_image_read_u16(const bms_df_image_t *image,
+                                       uint16_t physical_address, uint16_t *value)
+{
+    const uint8_t *low = bms_df_image_const_byte(image, physical_address);
+    const uint8_t *high = bms_df_image_const_byte(image, (uint16_t)(physical_address + 1U));
+
+    if (low == NULL || high == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *value = (uint16_t)*low | ((uint16_t)*high << 8);
+    return ESP_OK;
+}
+
+static esp_err_t bms_df_image_write_u16(bms_df_image_t *image,
+                                        uint16_t physical_address, uint16_t value)
+{
+    uint8_t *low = bms_df_image_byte(image, physical_address);
+    uint8_t *high = bms_df_image_byte(image, (uint16_t)(physical_address + 1U));
+
+    if (low == NULL || high == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *low = (uint8_t)value;
+    *high = (uint8_t)(value >> 8);
+    return ESP_OK;
+}
+
+static esp_err_t bms_df_image_read(bms_df_image_t *image)
+{
+    memset(image, 0, sizeof(*image));
+    for (size_t i = 0; i < sizeof(k_commission_rows) / sizeof(k_commission_rows[0]); ++i) {
+        image->row[i] = k_commission_rows[i];
+        ESP_RETURN_ON_ERROR(bms_df_read_row(image->row[i], image->original[i]), TAG,
+                            "read DF row 0x%02X", image->row[i]);
+        memcpy(image->updated[i], image->original[i], BMS_DF_ROW_SIZE);
+    }
+    return ESP_OK;
+}
+
+static void bms_log_df_image(const char *label, const bms_df_image_t *image)
+{
+    uint16_t initial_mode;
+    uint16_t design_voltage;
+    uint16_t capacity_mah;
+    uint16_t capacity_cwh;
+    uint16_t low_temp_voltage;
+    uint16_t standard_temp_voltage;
+    uint16_t high_temp_voltage;
+    uint16_t rec_temp_voltage;
+    char row_label[48];
+
+    for (size_t i = 0; i < sizeof(image->row) / sizeof(image->row[0]); ++i) {
+        snprintf(row_label, sizeof(row_label), "%s DF row 0x%02X", label, image->row[i]);
+        log_hex(row_label, image->updated[i], BMS_DF_ROW_SIZE);
+    }
+
+    if (bms_df_image_read_u16(image, DF_SBS_DATA_SUBCLASS + DF_SBS_INITIAL_BATTERY_MODE_OFFSET,
+                              &initial_mode) != ESP_OK ||
+        bms_df_image_read_u16(image, DF_SBS_DATA_SUBCLASS + DF_SBS_DESIGN_VOLTAGE_OFFSET,
+                              &design_voltage) != ESP_OK ||
+        bms_df_image_read_u16(image, DF_SBS_DATA_SUBCLASS + DF_SBS_DESIGN_CAPACITY_MAH_OFFSET,
+                              &capacity_mah) != ESP_OK ||
+        bms_df_image_read_u16(image, DF_SBS_DATA_SUBCLASS + DF_SBS_DESIGN_CAPACITY_CWH_OFFSET,
+                              &capacity_cwh) != ESP_OK ||
+        bms_df_image_read_u16(image, DF_LOW_TEMP_CHARGING_SUBCLASS + DF_CHARGING_VOLTAGE_OFFSET,
+                              &low_temp_voltage) != ESP_OK ||
+        bms_df_image_read_u16(image, DF_STANDARD_TEMP_CHARGING_SUBCLASS + DF_CHARGING_VOLTAGE_OFFSET,
+                              &standard_temp_voltage) != ESP_OK ||
+        bms_df_image_read_u16(image, DF_HIGH_TEMP_CHARGING_SUBCLASS + DF_CHARGING_VOLTAGE_OFFSET,
+                              &high_temp_voltage) != ESP_OK ||
+        bms_df_image_read_u16(image, DF_REC_TEMP_CHARGING_SUBCLASS + DF_CHARGING_VOLTAGE_OFFSET,
+                              &rec_temp_voltage) != ESP_OK) {
+        ESP_LOGE(TAG, "%s DF image does not contain all required fields", label);
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "%s profile: InitialBatteryMode=0x%04X CAPM=%u, DesignVoltage=%u mV, "
+             "DesignCapacity=%u mAh / %u x10mWh",
+             label, initial_mode, (unsigned)((initial_mode & BIT(15)) != 0), design_voltage,
+             capacity_mah, capacity_cwh);
+    ESP_LOGI(TAG, "%s charge voltage per cell: low=%u, standard=%u, high=%u, recommended=%u mV",
+             label, low_temp_voltage, standard_temp_voltage, high_temp_voltage, rec_temp_voltage);
+
+    static const uint8_t cov_threshold_offsets[] = {
+        DF_COV_THRESHOLD_LOW_OFFSET, DF_COV_THRESHOLD_STANDARD_OFFSET,
+        DF_COV_THRESHOLD_HIGH_OFFSET, DF_COV_THRESHOLD_REC_OFFSET,
+    };
+    static const uint8_t cov_recovery_offsets[] = {
+        DF_COV_RECOVERY_LOW_OFFSET, DF_COV_RECOVERY_STANDARD_OFFSET,
+        DF_COV_RECOVERY_HIGH_OFFSET, DF_COV_RECOVERY_REC_OFFSET,
+    };
+    uint16_t cov_thresholds[4];
+    uint16_t cov_recoveries[4];
+    for (size_t i = 0; i < sizeof(cov_thresholds) / sizeof(cov_thresholds[0]); ++i) {
+        if (bms_df_image_read_u16(image, DF_COV_SUBCLASS + cov_threshold_offsets[i],
+                                  &cov_thresholds[i]) != ESP_OK ||
+            bms_df_image_read_u16(image, DF_COV_SUBCLASS + cov_recovery_offsets[i],
+                                  &cov_recoveries[i]) != ESP_OK) {
+            ESP_LOGE(TAG, "%s DF image is missing COV fields", label);
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "%s COV threshold: low=%u, standard=%u, high=%u, recommended=%u mV",
+             label, cov_thresholds[0], cov_thresholds[1], cov_thresholds[2], cov_thresholds[3]);
+    ESP_LOGI(TAG, "%s COV recovery: low=%u, standard=%u, high=%u, recommended=%u mV",
+             label, cov_recoveries[0], cov_recoveries[1], cov_recoveries[2], cov_recoveries[3]);
+}
+
+static esp_err_t bms_log_profile(void)
+{
+    bms_df_image_t image;
+    uint16_t battery_mode;
+    esp_err_t err = bms_read_word(SBS_BATTERY_MODE, &battery_mode);
+
+    if (err != ESP_OK) {
+        log_error("BatteryMode", err);
+        return err;
+    }
+    ESP_LOGI(TAG, "BatteryMode=0x%04X CAPM=%u (%s)", battery_mode,
+             (unsigned)((battery_mode & BIT(15)) != 0),
+             (battery_mode & BIT(15)) != 0 ? "10mWh" : "mAh");
+
+    err = bms_df_image_read(&image);
+    if (err != ESP_OK) {
+        log_error("read commissioning Data Flash", err);
+        return err;
+    }
+    bms_log_df_image("CURRENT", &image);
+    return ESP_OK;
+}
+
+static bool bms_profile_is_valid(bms_profile_t *profile)
+{
+    const uint16_t charge_voltages[] = {
+        profile->low_temp_charge_mv,
+        profile->standard_temp_charge_mv,
+        profile->high_temp_charge_mv,
+        profile->rec_temp_charge_mv,
+    };
+    uint32_t capacity_cwh;
+
+    if (profile->capacity_mah < 100U || profile->capacity_mah > 32767U ||
+        profile->nominal_voltage_mv < 6000U ||
+        profile->nominal_voltage_mv > 18000U) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(charge_voltages) / sizeof(charge_voltages[0]); ++i) {
+        if (charge_voltages[i] < 2500U || charge_voltages[i] > 4350U) {
+            return false;
+        }
+    }
+
+    capacity_cwh = ((uint32_t)profile->capacity_mah * profile->nominal_voltage_mv + 5000U) / 10000U;
+    if (capacity_cwh == 0U || capacity_cwh > 32767U) {
+        return false;
+    }
+    profile->capacity_cwh = (uint16_t)capacity_cwh;
+    return true;
+}
+
+static esp_err_t bms_df_apply_profile_to_image(bms_df_image_t *image,
+                                                const bms_profile_t *profile)
+{
+    const uint16_t charge_voltages[] = {
+        profile->low_temp_charge_mv,
+        profile->standard_temp_charge_mv,
+        profile->high_temp_charge_mv,
+        profile->rec_temp_charge_mv,
+    };
+    const uint16_t charge_subclasses[] = {
+        DF_LOW_TEMP_CHARGING_SUBCLASS,
+        DF_STANDARD_TEMP_CHARGING_SUBCLASS,
+        DF_HIGH_TEMP_CHARGING_SUBCLASS,
+        DF_REC_TEMP_CHARGING_SUBCLASS,
+    };
+    uint16_t highest_charge_voltage = profile->low_temp_charge_mv;
+    static const uint8_t cov_threshold_offsets[] = {
+        DF_COV_THRESHOLD_LOW_OFFSET, DF_COV_THRESHOLD_STANDARD_OFFSET,
+        DF_COV_THRESHOLD_HIGH_OFFSET, DF_COV_THRESHOLD_REC_OFFSET,
+    };
+    static const uint8_t cov_recovery_offsets[] = {
+        DF_COV_RECOVERY_LOW_OFFSET, DF_COV_RECOVERY_STANDARD_OFFSET,
+        DF_COV_RECOVERY_HIGH_OFFSET, DF_COV_RECOVERY_REC_OFFSET,
+    };
+
+    for (size_t i = 1; i < sizeof(charge_voltages) / sizeof(charge_voltages[0]); ++i) {
+        if (charge_voltages[i] > highest_charge_voltage) {
+            highest_charge_voltage = charge_voltages[i];
+        }
+    }
+    const uint16_t cov_threshold = (uint16_t)(highest_charge_voltage + BMS_COV_MARGIN_MV);
+    const uint16_t cov_recovery = (uint16_t)(highest_charge_voltage - BMS_COV_MARGIN_MV);
+
+    ESP_RETURN_ON_ERROR(bms_df_image_write_u16(image,
+                                                DF_SBS_DATA_SUBCLASS + DF_SBS_DESIGN_VOLTAGE_OFFSET,
+                                                profile->nominal_voltage_mv), TAG, "set DesignVoltage");
+    ESP_RETURN_ON_ERROR(bms_df_image_write_u16(image,
+                                                DF_SBS_DATA_SUBCLASS + DF_SBS_DESIGN_CAPACITY_MAH_OFFSET,
+                                                profile->capacity_mah), TAG, "set DesignCapacity mAh");
+    ESP_RETURN_ON_ERROR(bms_df_image_write_u16(image,
+                                                DF_SBS_DATA_SUBCLASS + DF_SBS_DESIGN_CAPACITY_CWH_OFFSET,
+                                                profile->capacity_cwh), TAG, "set DesignCapacity 10mWh");
+
+    for (size_t i = 0; i < sizeof(charge_subclasses) / sizeof(charge_subclasses[0]); ++i) {
+        ESP_RETURN_ON_ERROR(bms_df_image_write_u16(image,
+                                                    charge_subclasses[i] + DF_CHARGING_VOLTAGE_OFFSET,
+                                                    charge_voltages[i]), TAG,
+                            "set charge voltage %u", (unsigned)i);
+        ESP_RETURN_ON_ERROR(bms_df_image_write_u16(image,
+                                                    DF_COV_SUBCLASS + cov_threshold_offsets[i],
+                                                    cov_threshold), TAG,
+                            "set COV threshold %u", (unsigned)i);
+        ESP_RETURN_ON_ERROR(bms_df_image_write_u16(image,
+                                                    DF_COV_SUBCLASS + cov_recovery_offsets[i],
+                                                    cov_recovery), TAG,
+                            "set COV recovery %u", (unsigned)i);
+    }
+
+    for (size_t i = 0; i < sizeof(image->row) / sizeof(image->row[0]); ++i) {
+        image->dirty[i] = memcmp(image->original[i], image->updated[i], BMS_DF_ROW_SIZE) != 0;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t bms_df_commit_image(const bms_df_image_t *image)
+{
+    bool touched[sizeof(image->row) / sizeof(image->row[0])] = {false};
+    uint8_t verify[BMS_DF_ROW_SIZE];
+    esp_err_t err = ESP_OK;
+
+    for (size_t i = 0; i < sizeof(image->row) / sizeof(image->row[0]); ++i) {
+        if (!image->dirty[i]) {
+            continue;
+        }
+        ESP_LOGW(TAG, "Writing Data Flash row 0x%02X", image->row[i]);
+        touched[i] = true;
+        err = bms_df_write_row(image->row[i], image->updated[i]);
+        if (err != ESP_OK) {
+            log_error("write Data Flash row", err);
+            goto rollback;
+        }
+        vTaskDelay(pdMS_TO_TICKS(BMS_DF_WRITE_WAIT_MS));
+        err = bms_df_read_row(image->row[i], verify);
+        if (err != ESP_OK) {
+            log_error("verify read Data Flash row", err);
+            goto rollback;
+        }
+        if (memcmp(verify, image->updated[i], BMS_DF_ROW_SIZE) != 0) {
+            ESP_LOGE(TAG, "Data Flash verification mismatch for row 0x%02X", image->row[i]);
+            err = ESP_ERR_INVALID_RESPONSE;
+            goto rollback;
+        }
+        ESP_LOGI(TAG, "Verified Data Flash row 0x%02X", image->row[i]);
+    }
+    return ESP_OK;
+
+rollback:
+    ESP_LOGW(TAG, "Commissioning write failed; attempting rollback of touched Data Flash rows");
+    for (size_t i = sizeof(image->row) / sizeof(image->row[0]); i-- > 0;) {
+        if (!touched[i]) {
+            continue;
+        }
+        const esp_err_t restore_err = bms_df_write_row(image->row[i], image->original[i]);
+        if (restore_err == ESP_OK) {
+            ESP_LOGI(TAG, "Rollback command sent for DF row 0x%02X", image->row[i]);
+        } else {
+            log_error("rollback Data Flash row", restore_err);
+        }
+    }
+    return err;
+}
+
+static esp_err_t bms_apply_profile(const bms_profile_t *profile)
+{
+    bms_df_image_t image;
+    esp_err_t err;
+
+    if (!g_full_access_session) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    err = bms_df_image_read(&image);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+    bms_log_df_image("BACKUP", &image);
+    ESP_RETURN_ON_ERROR(bms_df_apply_profile_to_image(&image, profile), TAG,
+                        "prepare commissioning profile");
+    bms_log_df_image("PROPOSED", &image);
+
+    err = bms_df_commit_image(&image);
+    if (err != ESP_OK) {
+        return err;
+    }
+    ESP_LOGI(TAG, "Data Flash profile committed; reading live SBS profile");
+    return bms_log_profile();
+}
+
+static esp_err_t bms_reset_cudep_pf_in_session(void)
 {
     uint32_t pf_status = 0;
     esp_err_t err;
 
     if (!g_unsealed_session) {
-        ESP_LOGE(TAG, "PF reset refused: run 'unseal CONFIRM' successfully first");
-        return;
+        return ESP_ERR_INVALID_STATE;
     }
 
     err = bms_read_mfg_u32(MA_PF_STATUS, &pf_status);
     if (err != ESP_OK) {
-        log_error("read PFStatus before reset", err);
-        goto reseal;
+        return err;
     }
     bms_log_pf_status(pf_status);
-    if ((pf_status & PF_BLOCKED_MASK) != 0) {
-        ESP_LOGE(TAG, "PF reset refused by firmware safety gate");
-        goto reseal;
+    if (pf_status == 0) {
+        ESP_LOGI(TAG, "PFStatus is already clear");
+        return ESP_OK;
+    }
+    if (pf_status != PF_CUDEP_MASK) {
+        ESP_LOGE(TAG, "PF reset refused: only PFStatus=0x%08X (CUDEP only) is allowed", PF_CUDEP_MASK);
+        return ESP_ERR_INVALID_STATE;
     }
 
     ESP_LOGW(TAG, "Sending Permanent Fail Data Reset (MA 0x0029)");
     err = bms_write_word(SBS_MANUFACTURER_ACCESS, MA_PF_DATA_RESET);
     if (err != ESP_OK) {
-        log_error("PF data reset", err);
-        goto reseal;
+        return err;
     }
     vTaskDelay(pdMS_TO_TICKS(BMS_UNSEAL_WAIT_MS));
-    ESP_LOGI(TAG, "PF reset command accepted; collecting post-reset snapshot");
+    ESP_RETURN_ON_ERROR(bms_read_mfg_u32(MA_PF_STATUS, &pf_status), TAG,
+                        "read PFStatus after reset");
+    bms_log_pf_status(pf_status);
+    return pf_status == 0 ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+static void bms_run_pf_reset(void)
+{
+    esp_err_t err = bms_reset_cudep_pf_in_session();
+    if (err != ESP_OK) {
+        log_error("CUDEP PF reset", err);
+    }
+    ESP_LOGI(TAG, "Collecting post-reset snapshot");
     bms_log_snapshot();
 
-reseal:
     err = bms_seal();
     if (err != ESP_OK) {
         log_error("seal after PF operation", err);
     }
+}
+
+static void bms_run_commission(const bms_profile_t *profile)
+{
+    uint32_t pf_status;
+    esp_err_t err;
+
+    if (g_unsealed_session) {
+        ESP_LOGE(TAG, "Commissioning requires a sealed starting state; run 'seal CONFIRM' first");
+        return;
+    }
+    if (bms_probe() != ESP_OK) {
+        ESP_LOGE(TAG, "Commissioning refused: BMS is not responding");
+        return;
+    }
+    err = bms_read_mfg_u32(MA_PF_STATUS, &pf_status);
+    if (err != ESP_OK) {
+        log_error("read PFStatus before commissioning", err);
+        return;
+    }
+    if (pf_status != 0 && pf_status != PF_CUDEP_MASK) {
+        bms_log_pf_status(pf_status);
+        ESP_LOGE(TAG, "Commissioning refused: PF is not clear or CUDEP-only");
+        return;
+    }
+
+    ESP_LOGW(TAG,
+             "COMMISSIONING START: capacity=%u mAh, nominal=%u mV, charge cell voltages=%u/%u/%u/%u mV",
+             profile->capacity_mah, profile->nominal_voltage_mv, profile->low_temp_charge_mv,
+             profile->standard_temp_charge_mv, profile->high_temp_charge_mv, profile->rec_temp_charge_mv);
+    bms_log_full_dump();
+    err = bms_unseal();
+    if (err != ESP_OK) {
+        log_error("unseal for commissioning", err);
+        goto reseal;
+    }
+    err = bms_full_access();
+    if (err != ESP_OK) {
+        log_error("full access for commissioning", err);
+        goto reseal;
+    }
+    err = bms_apply_profile(profile);
+    if (err != ESP_OK) {
+        log_error("apply commissioning profile", err);
+        goto reseal;
+    }
+    err = bms_reset_cudep_pf_in_session();
+    if (err != ESP_OK) {
+        log_error("clear CUDEP after profile update", err);
+        goto reseal;
+    }
+    ESP_LOGI(TAG, "Commissioning profile verified and PF is clear");
+
+reseal:
+    {
+        const esp_err_t seal_err = bms_seal();
+        if (seal_err != ESP_OK) {
+            log_error("seal after commissioning", seal_err);
+        }
+    }
+    bms_log_snapshot();
+    ESP_LOGI(TAG, "COMMISSIONING END");
 }
 
 static void print_help(void)
@@ -603,8 +1149,11 @@ static void print_help(void)
            "  snapshot             Log core SBS and BQ status\n"
            "  dump                 Log full SBS/BQ status, lifetime and IT blocks\n"
            "  watch on|off         Enable or disable a 2-second core snapshot\n"
+           "  profile show         Read and log commissioning Data Flash rows\n"
+           "  commission <mAh> <nominal-mV> <low-mV> <std-mV> <high-mV> <rec-mV> CONFIRM\n"
+           "                       Apply profile, clear CUDEP-only PF, verify and seal\n"
            "  unseal CONFIRM       Run BQ30 SHA-1 unseal using the configured candidate key\n"
-           "  pf-reset CONFIRM     Reset PF only in an unsealed session; always seals afterward\n"
+           "  pf-reset CONFIRM     Reset CUDEP-only PF in an unsealed session; always seals afterward\n"
            "  seal CONFIRM         Send Seal command and end the write session\n\n");
 }
 
@@ -613,11 +1162,63 @@ static bool has_confirm(const char *argument)
     return argument != NULL && strcmp(argument, "CONFIRM") == 0;
 }
 
+static bool parse_u16(const char *text, uint16_t *value)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (text == NULL || *text == '\0') {
+        return false;
+    }
+    errno = 0;
+    parsed = strtoul(text, &end, 0);
+    if (errno != 0 || end == text || *end != '\0' || parsed > UINT16_MAX) {
+        return false;
+    }
+    *value = (uint16_t)parsed;
+    return true;
+}
+
+static bool parse_commission_profile(char *const arguments[], size_t argument_count,
+                                     bms_profile_t *profile)
+{
+    uint16_t values[6];
+
+    if (argument_count != 7 || !has_confirm(arguments[6])) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+        if (!parse_u16(arguments[i], &values[i])) {
+            return false;
+        }
+    }
+
+    *profile = (bms_profile_t){
+        .capacity_mah = values[0],
+        .nominal_voltage_mv = values[1],
+        .low_temp_charge_mv = values[2],
+        .standard_temp_charge_mv = values[3],
+        .high_temp_charge_mv = values[4],
+        .rec_temp_charge_mv = values[5],
+    };
+    return bms_profile_is_valid(profile);
+}
+
 static void handle_command(char *line)
 {
     char *saveptr = NULL;
     char *command = strtok_r(line, " \t\r\n", &saveptr);
-    char *argument = strtok_r(NULL, " \t\r\n", &saveptr);
+    char *arguments[8] = {0};
+    size_t argument_count = 0;
+
+    while (argument_count < sizeof(arguments) / sizeof(arguments[0])) {
+        char *argument = strtok_r(NULL, " \t\r\n", &saveptr);
+        if (argument == NULL) {
+            break;
+        }
+        arguments[argument_count++] = argument;
+    }
+    char *argument = arguments[0];
 
     if (command == NULL) {
         return;
@@ -658,6 +1259,24 @@ static void handle_command(char *line)
         bms_log_snapshot();
     } else if (strcasecmp(command, "dump") == 0) {
         bms_log_full_dump();
+    } else if (strcasecmp(command, "profile") == 0) {
+        if (argument_count != 1 || strcasecmp(argument, "show") != 0) {
+            ESP_LOGW(TAG, "Usage: profile show");
+        } else {
+            const esp_err_t err = bms_log_profile();
+            if (err != ESP_OK) {
+                log_error("profile show", err);
+            }
+        }
+    } else if (strcasecmp(command, "commission") == 0) {
+        bms_profile_t profile;
+        if (!parse_commission_profile(arguments, argument_count, &profile)) {
+            ESP_LOGW(TAG,
+                     "Usage: commission <mAh> <nominal-mV> <low-mV> <std-mV> <high-mV> <rec-mV> CONFIRM");
+            ESP_LOGW(TAG, "mAh=100..32767; nominal=6000..18000; each charge voltage=2500..4350 mV");
+        } else {
+            bms_run_commission(&profile);
+        }
     } else if (strcasecmp(command, "unseal") == 0) {
         if (!has_confirm(argument)) {
             ESP_LOGW(TAG, "Usage: unseal CONFIRM");
