@@ -13,6 +13,8 @@
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -73,6 +75,16 @@
 #define BMS_MONITOR_PERIOD_MS    2000
 #define BMS_DF_WRITE_WAIT_MS     100
 #define BMS_DF_ROW_SIZE          32
+
+/*
+ * The classic ESP32 I2C timeout register is 20 bits at an 80-MHz source
+ * clock, so its maximum SCL-low wait is only about 13 ms. The BQ30 SHA-1
+ * response can legitimately hold SCL longer. Use a software open-drain write
+ * only for the long ManufacturerInput blocks; normal SBS traffic stays on the
+ * ESP-IDF hardware controller.
+ */
+#define BMS_SOFT_I2C_HALF_PERIOD_US       20
+#define BMS_SOFT_I2C_STRETCH_TIMEOUT_US   500000
 
 #define SBS_MANUFACTURER_ACCESS  0x00
 #define SBS_MANUFACTURER_DATA    0x23
@@ -158,6 +170,8 @@ static bool g_bms_ready;
 static bool g_unsealed_session;
 static bool g_full_access_session;
 static bool g_watch_enabled;
+
+static esp_err_t bms_software_write_frame(const uint8_t *frame, size_t length);
 
 static uint16_t le16(const uint8_t *data)
 {
@@ -245,6 +259,145 @@ static esp_err_t bms_i2c_init(void)
         .flags.disable_ack_check = false,
     };
     return i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &g_bms);
+}
+
+static inline void bms_soft_i2c_delay(void)
+{
+    esp_rom_delay_us(BMS_SOFT_I2C_HALF_PERIOD_US);
+}
+
+static esp_err_t bms_soft_i2c_scl_high(void)
+{
+    const int64_t deadline = esp_timer_get_time() + BMS_SOFT_I2C_STRETCH_TIMEOUT_US;
+
+    gpio_set_level(BMS_SCL_GPIO, 1); /* Open-drain high means release SCL. */
+    while (gpio_get_level(BMS_SCL_GPIO) == 0) {
+        if (esp_timer_get_time() >= deadline) {
+            return ESP_ERR_TIMEOUT;
+        }
+        esp_rom_delay_us(10);
+    }
+    return ESP_OK;
+}
+
+static void bms_soft_i2c_scl_low(void)
+{
+    gpio_set_level(BMS_SCL_GPIO, 0);
+}
+
+static esp_err_t bms_soft_i2c_start(void)
+{
+    gpio_set_level(BMS_SDA_GPIO, 1);
+    bms_soft_i2c_delay();
+    ESP_RETURN_ON_ERROR(bms_soft_i2c_scl_high(), TAG, "release SCL for software START");
+    bms_soft_i2c_delay();
+    gpio_set_level(BMS_SDA_GPIO, 0);
+    bms_soft_i2c_delay();
+    bms_soft_i2c_scl_low();
+    bms_soft_i2c_delay();
+    return ESP_OK;
+}
+
+static esp_err_t bms_soft_i2c_write_bit(bool one)
+{
+    gpio_set_level(BMS_SDA_GPIO, one ? 1 : 0);
+    bms_soft_i2c_delay();
+    ESP_RETURN_ON_ERROR(bms_soft_i2c_scl_high(), TAG, "release SCL for software bit");
+    bms_soft_i2c_delay();
+    bms_soft_i2c_scl_low();
+    bms_soft_i2c_delay();
+    return ESP_OK;
+}
+
+static esp_err_t bms_soft_i2c_write_byte(uint8_t value)
+{
+    for (uint8_t mask = 0x80; mask != 0; mask >>= 1) {
+        ESP_RETURN_ON_ERROR(bms_soft_i2c_write_bit((value & mask) != 0), TAG,
+                            "write software SMBus data bit");
+    }
+
+    gpio_set_level(BMS_SDA_GPIO, 1); /* Release SDA for the target ACK bit. */
+    bms_soft_i2c_delay();
+    ESP_RETURN_ON_ERROR(bms_soft_i2c_scl_high(), TAG, "release SCL for target ACK");
+    const bool ack = gpio_get_level(BMS_SDA_GPIO) == 0;
+    bms_soft_i2c_delay();
+    bms_soft_i2c_scl_low();
+    bms_soft_i2c_delay();
+    return ack ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t bms_soft_i2c_stop(void)
+{
+    gpio_set_level(BMS_SDA_GPIO, 0);
+    bms_soft_i2c_delay();
+    ESP_RETURN_ON_ERROR(bms_soft_i2c_scl_high(), TAG, "release SCL for software STOP");
+    bms_soft_i2c_delay();
+    gpio_set_level(BMS_SDA_GPIO, 1);
+    bms_soft_i2c_delay();
+    return ESP_OK;
+}
+
+static esp_err_t bms_i2c_suspend_hardware(void)
+{
+    esp_err_t err = i2c_master_bus_rm_device(g_bms);
+    if (err != ESP_OK) {
+        return err;
+    }
+    g_bms = NULL;
+    err = i2c_del_master_bus(g_i2c_bus);
+    if (err != ESP_OK) {
+        return err;
+    }
+    g_i2c_bus = NULL;
+    return ESP_OK;
+}
+
+static esp_err_t bms_software_write_frame(const uint8_t *frame, size_t length)
+{
+    const uint64_t pins = (1ULL << BMS_SDA_GPIO_NUM) | (1ULL << BMS_SCL_GPIO_NUM);
+    const gpio_config_t cfg = {
+        .pin_bit_mask = pins,
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err;
+    esp_err_t resume_err;
+    bool started = false;
+
+#if BMS_USE_PEC
+    (void)frame;
+    (void)length;
+    ESP_LOGE(TAG, "software ManufacturerInput writer does not support PEC");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+
+    ESP_RETURN_ON_ERROR(bms_i2c_suspend_hardware(), TAG, "release hardware I2C for software write");
+    err = gpio_config(&cfg);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Software SMBus write: %u bytes, SCL stretch limit=%u us",
+                 (unsigned)length, BMS_SOFT_I2C_STRETCH_TIMEOUT_US);
+        err = bms_soft_i2c_start();
+        started = err == ESP_OK;
+    }
+    for (size_t i = 0; err == ESP_OK && i < length; ++i) {
+        err = bms_soft_i2c_write_byte(frame[i]);
+    }
+    if (started) {
+        const esp_err_t stop_err = bms_soft_i2c_stop();
+        if (err == ESP_OK && stop_err != ESP_OK) {
+            err = stop_err;
+        }
+    }
+
+    /* Always restore the ESP-IDF hardware controller before returning. */
+    resume_err = bms_i2c_init();
+    if (resume_err != ESP_OK) {
+        g_bms_ready = false;
+        log_error("restore hardware I2C after software write", resume_err);
+    }
+    return err != ESP_OK ? err : resume_err;
 }
 
 static void bms_log_line_levels(void)
@@ -355,6 +508,10 @@ static esp_err_t bms_write_block(uint8_t command, const uint8_t *payload,
 #if BMS_USE_PEC
     tx[length + 2] = bms_write_pec(tx, length + 2);
 #endif
+
+    if (command == SBS_MANUFACTURER_INPUT && length >= 20) {
+        return bms_software_write_frame(tx, length + 2 + BMS_USE_PEC);
+    }
     return i2c_master_transmit(g_bms, tx, length + 2 + BMS_USE_PEC, BMS_TIMEOUT_MS);
 }
 

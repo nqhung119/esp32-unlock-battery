@@ -14,6 +14,12 @@ ESP32 giữ SCL tối đa 12 ms cho mỗi phase của giao dịch. Giá trị n�
 default 2 ms của ESP-IDF, vì BQ30Z554 có thể clock-stretch khi nhận block
 `ManufacturerInput` 20 byte trong SHA-1 authentication.
 
+ESP32 đời đầu có thanh ghi I²C hardware chỉ đợi SCL-low tối đa khoảng 13 ms.
+Vì BQ30 có thể kéo SCL lâu hơn khi nhận block SHA-1/Data Flash, firmware tự
+tạm nhả hardware I²C và truyền riêng các block `ManufacturerInput` dài 20/32
+byte bằng GPIO open-drain; mỗi cạnh SCL được đợi tối đa 500 ms, rồi hardware
+I²C được khôi phục. Các lệnh SBS ngắn vẫn dùng driver ESP-IDF.
+
 PEC là tuỳ chọn của SBS. Firmware có thể thêm/kiểm tra PEC (CRC-8,
 polynomial `0x07`) khi build với `BMS_USE_PEC=1`; nhưng board DJI này được
 quan sát giao tiếp ổn định với host PEC tắt, nên cấu hình mặc định là `0`.
