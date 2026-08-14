@@ -271,7 +271,7 @@ Khung trên giả định BMS không bật PEC, giống đường I²C trong bà
 
 1. **Đọc trước khi ghi.** Đọc Device Type, Firmware Version, `PFStatus (0x0053)`, `SafetyStatus (0x0051)`, `OperationStatus (0x0054)`, `Voltages (0x0071)` và `Temperatures (0x0072)` qua `MA`/`ManufacturerData`. Lưu raw bytes, giá trị giải mã và timestamp.
 2. **Đánh giá nguyên nhân.** Chỉ tiếp tục nếu cell, cảm biến nhiệt, đường balance, FET và cầu chì đã được kiểm tra độc lập; pack không phồng/nóng và không có PF thuộc nhóm cấm nêu trên.
-3. **Unseal.** Gọi `bms_unseal(kd)`, rồi đọc lại `OperationStatus`. Nếu không phải Unsealed sau 250 ms, không reset PF; gọi `bms_seal()` nếu state đã đổi và dừng.
+3. **Unseal.** Gọi `bms_unseal(kd)`, rồi đọc lại `OperationStatus`. Chấp nhận khi state là Unsealed hoặc Full Access; nếu không đạt một trong hai state này sau 250 ms, không reset PF, gọi `bms_seal()` nếu state đã đổi và dừng.
 4. **Xoá PF.** Gọi đúng một lần `bms_clear_pf()`, tức truyền `00 29 00`. Không lặp vô hạn khi lỗi I²C/NACK.
 5. **Xác minh ngay.** Đọc lại `PFStatus`, `SafetyStatus`, `OperationStatus`, `Voltages`, `Temperatures` và log kết quả. Cờ PF có thể xuất hiện lại nếu lỗi thực chưa được khắc phục.
 6. **Seal.** Gọi `bms_seal()` (`00 30 00`) ngay cả khi bước 4 hoặc 5 lỗi.
@@ -317,15 +317,15 @@ commission <mAh> <nominal-mV> <low-mV> <std-mV> <high-mV> <rec-mV> CONFIRM
 
 Firmware giới hạn `mAh` từ 100 đến 32767, nominal voltage từ 6000 đến 18000 mV và mỗi charge voltage từ 2500 đến 4350 mV. Nó tính tự động `DesignCapacity` ở hai dạng: mAh và `10 mWh` (`mAh × nominal-mV / 10000`, làm tròn gần nhất). Bit `CAPM` trong `BatteryMode()` được giữ nguyên; do đó `DesignCapacity()` sẽ report đúng theo mode của pack.
 
-Theo Table 11-1 của TI, transaction backup toàn bộ năm row Data Flash `0x03`, `0x04`, `0x08`, `0x0F`, `0x10`; rồi chỉ sửa các trường sau và đọc lại từng row để verify:
+Theo Table 11-1 của TI và raw DF quan sát trên firmware WM220 này, transaction backup toàn bộ sáu row Data Flash `0x03`, `0x04`, `0x08`, `0x09`, `0x0F`, `0x10`; rồi chỉ sửa các trường sau và đọc lại từng row để verify:
 
 - SBS Data: `DesignVoltage`, `DesignCapacity` mAh và `DesignCapacity` 10 mWh.
 - Advanced Charging Algorithm: low, standard, high và recommended temperature charging voltage.
-- Protections:COV: cả bốn threshold và recovery. Firmware đặt threshold cao hơn charge voltage lớn nhất 50 mV và recovery thấp hơn 50 mV.
+- Protections:COV: cả bốn threshold và recovery. Firmware giữ margin COV hiện có của pack theo từng dải nhiệt độ, fallback về ±50 mV nếu không đọc được margin hợp lệ.
 
-`DesignCapacity` 10 mWh bắt đầu tại byte cuối row `0x0F`, vì vậy firmware luôn đọc/ghi cả row `0x0F` lẫn `0x10`. Giá trị Data Flash `I2` được lưu little-endian; SMBus word cũng truyền LSB trước. [TI Appendix B: Reading and Writing to Data Flash](https://www.ti.com/lit/pdf/sluua79)
+Với firmware WM220 đã đo, SBS Data nằm tại base `502`, COV tại base `275`, và `DesignCapacity` 10 mWh nằm trong row `0x10`; vì vậy firmware luôn đọc/ghi cả row `0x0F` lẫn `0x10`. Giá trị số trong các row Data Flash này dùng big-endian; SMBus word vẫn truyền LSB trước. [TI Appendix B: Reading and Writing to Data Flash](https://www.ti.com/lit/pdf/sluua79)
 
-Ghi Data Flash cần **Full Access** sau Unseal. Nếu SHA-1 key được cấu hình không mở được `SEC1/SEC0 = 00`, firmware dừng trước bất kỳ lệnh ghi nào và Seal lại. Sau mỗi row write lỗi hoặc verify mismatch, firmware cố gửi lại backup của các row đã chạm rồi Seal. TI cũng lưu ý rằng DF write failure sẽ latch PF và cấm ghi tiếp. [TI: Data Flash Permanent Fail](https://www.ti.com/lit/pdf/sluua79)
+Ghi Data Flash cần **Full Access** sau Unseal. Theo `OperationStatus()`, `SEC1/SEC0 = 1/0` là Full Access, `0/1` là Unsealed, `1/1` là Sealed và `0/0` là Reserved. Nếu SHA-1 key không mở được Full Access, firmware dừng trước bất kỳ lệnh ghi nào và Seal lại. Sau mỗi row write lỗi hoặc verify mismatch, firmware cố gửi lại backup của các row đã chạm rồi Seal. TI cũng lưu ý rằng DF write failure sẽ latch PF và cấm ghi tiếp. [TI: Data Flash Permanent Fail](https://www.ti.com/lit/pdf/sluua79)
 
 Transaction chỉ tiếp tục khi `PFStatus` bằng `0` hoặc chỉ có `CUDEP` (`0x00000004`). Với CUDEP-only, firmware ghi profile trước, gửi `MA 0x0029`, yêu cầu `PFStatus=0` khi đọc lại, rồi Seal. Các cờ fuse, AFE, PTC, instruction flash, Open VCx và Data Flash failure vẫn bị từ chối.
 

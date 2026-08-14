@@ -72,6 +72,10 @@
 #define BMS_PROBE_RETRY_WAIT_MS  50
 #define BMS_MFG_SELECT_WAIT_MS   10
 #define BMS_UNSEAL_WAIT_MS       250
+#define BMS_AUTH_STATUS_ATTEMPTS 6
+#define BMS_AUTH_STATUS_RETRY_WAIT_MS 150
+#define BMS_SEAL_ATTEMPTS        4
+#define BMS_SEAL_RETRY_WAIT_MS   150
 #define BMS_MONITOR_PERIOD_MS    2000
 #define BMS_DF_WRITE_WAIT_MS     100
 #define BMS_DF_ROW_SIZE          32
@@ -130,8 +134,12 @@
 #define PF_HARD_BLOCKED_MASK      (BIT(18) | BIT(19) | BIT(20) | BIT(21) | \
                                   BIT(22) | BIT(23) | BIT(24) | BIT(25) | BIT(26))
 
-/* TI SLUUA79 Table 11-1: physical DF address is subclass ID + offset. */
-#define DF_SBS_DATA_SUBCLASS                  489
+/*
+ * TI SLUUA79 Table 11-1 gives DF physical address as subclass ID + offset.
+ * The WM220/BQ30Z554 firmware observed on this pack stores SBS Data at 502;
+ * the live SBS words and DF row bytes agree at this base address.
+ */
+#define DF_SBS_DATA_SUBCLASS                  502
 #define DF_SBS_INITIAL_BATTERY_MODE_OFFSET      6
 #define DF_SBS_DESIGN_VOLTAGE_OFFSET             8
 #define DF_SBS_DESIGN_CAPACITY_MAH_OFFSET       20
@@ -143,7 +151,7 @@
 #define DF_REC_TEMP_CHARGING_SUBCLASS          140
 #define DF_CHARGING_VOLTAGE_OFFSET               0
 
-#define DF_COV_SUBCLASS                         267
+#define DF_COV_SUBCLASS                         275
 #define DF_COV_THRESHOLD_LOW_OFFSET               0
 #define DF_COV_THRESHOLD_STANDARD_OFFSET          2
 #define DF_COV_THRESHOLD_HIGH_OFFSET              4
@@ -154,6 +162,7 @@
 #define DF_COV_RECOVERY_REC_OFFSET                15
 
 #define BMS_COV_MARGIN_MV                         50
+#define BMS_DF_COMMISSION_ROW_COUNT                6
 
 static const char *TAG = "bms";
 
@@ -381,6 +390,9 @@ static esp_err_t bms_software_write_frame(const uint8_t *frame, size_t length)
         err = bms_soft_i2c_start();
         started = err == ESP_OK;
     }
+    if (err == ESP_OK) {
+        err = bms_soft_i2c_write_byte((uint8_t)(BMS_ADDRESS << 1));
+    }
     for (size_t i = 0; err == ESP_OK && i < length; ++i) {
         err = bms_soft_i2c_write_byte(frame[i]);
     }
@@ -545,7 +557,7 @@ static bool bms_security_is_full_access(uint32_t operation_status)
 {
     const uint8_t sec0 = (operation_status >> 8) & 1U;
     const uint8_t sec1 = (operation_status >> 9) & 1U;
-    return sec1 == 0 && sec0 == 0;
+    return sec1 == 1 && sec0 == 0;
 }
 
 static bool bms_security_is_sealed(uint32_t operation_status)
@@ -577,6 +589,50 @@ static void bms_log_operation_status(uint32_t value)
              value, sec1, sec0, security, (unsigned)((value >> 12) & 1U),
              (unsigned)((value >> 1) & 1U), (unsigned)((value >> 2) & 1U),
              (unsigned)((value >> 13) & 1U), (unsigned)((value >> 14) & 1U));
+}
+
+static void bms_recover_i2c_after_error(const char *operation)
+{
+    const esp_err_t reset_err = i2c_master_bus_reset(g_i2c_bus);
+    if (reset_err != ESP_OK) {
+        log_error(operation, reset_err);
+    }
+}
+
+static esp_err_t bms_read_operation_status_with_recovery(uint32_t *operation_status)
+{
+    esp_err_t err = ESP_FAIL;
+
+    for (unsigned int attempt = 1; attempt <= BMS_AUTH_STATUS_ATTEMPTS; ++attempt) {
+        err = bms_read_mfg_u32(MA_OPERATION_STATUS, operation_status);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG, "OperationStatus read attempt %u/%u failed: %s",
+                 attempt, BMS_AUTH_STATUS_ATTEMPTS, esp_err_to_name(err));
+        bms_recover_i2c_after_error("I2C bus recovery after authentication");
+        vTaskDelay(pdMS_TO_TICKS(BMS_AUTH_STATUS_RETRY_WAIT_MS));
+    }
+    return err;
+}
+
+static esp_err_t bms_read_pf_status_with_recovery(uint32_t *pf_status)
+{
+    esp_err_t err = ESP_FAIL;
+
+    for (unsigned int attempt = 1; attempt <= BMS_AUTH_STATUS_ATTEMPTS; ++attempt) {
+        err = bms_read_mfg_u32(MA_PF_STATUS, pf_status);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG, "PFStatus read attempt %u/%u failed: %s",
+                 attempt, BMS_AUTH_STATUS_ATTEMPTS, esp_err_to_name(err));
+        bms_recover_i2c_after_error("I2C bus recovery after PF reset");
+        vTaskDelay(pdMS_TO_TICKS(BMS_AUTH_STATUS_RETRY_WAIT_MS));
+    }
+    return err;
 }
 
 static void bms_log_pf_status(uint32_t value)
@@ -864,9 +920,15 @@ static esp_err_t bms_unseal(void)
                         "write unseal response");
     vTaskDelay(pdMS_TO_TICKS(BMS_UNSEAL_WAIT_MS));
 
-    ESP_RETURN_ON_ERROR(bms_read_mfg_u32(MA_OPERATION_STATUS, &operation_status), TAG,
+    ESP_RETURN_ON_ERROR(bms_read_operation_status_with_recovery(&operation_status), TAG,
                         "read operation status after unseal");
     bms_log_operation_status(operation_status);
+    if (bms_security_is_full_access(operation_status)) {
+        g_unsealed_session = true;
+        g_full_access_session = true;
+        ESP_LOGW(TAG, "BMS is already in FULL ACCESS after authentication.");
+        return ESP_OK;
+    }
     if (!bms_security_is_unsealed(operation_status)) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -899,7 +961,7 @@ static esp_err_t bms_full_access(void)
                         "write full access response");
     vTaskDelay(pdMS_TO_TICKS(BMS_UNSEAL_WAIT_MS));
 
-    ESP_RETURN_ON_ERROR(bms_read_mfg_u32(MA_OPERATION_STATUS, &operation_status), TAG,
+    ESP_RETURN_ON_ERROR(bms_read_operation_status_with_recovery(&operation_status), TAG,
                         "read operation status after full access");
     bms_log_operation_status(operation_status);
     if (!bms_security_is_full_access(operation_status)) {
@@ -913,11 +975,33 @@ static esp_err_t bms_full_access(void)
 
 static esp_err_t bms_seal(void)
 {
-    esp_err_t err = bms_write_word(SBS_MANUFACTURER_ACCESS, MA_SEAL);
-    if (err == ESP_OK) {
-        g_unsealed_session = false;
-        g_full_access_session = false;
-        ESP_LOGI(TAG, "Seal command sent");
+    esp_err_t err = ESP_FAIL;
+
+    for (unsigned int attempt = 1; attempt <= BMS_SEAL_ATTEMPTS; ++attempt) {
+        err = bms_write_word(SBS_MANUFACTURER_ACCESS, MA_SEAL);
+        if (err == ESP_OK) {
+            uint32_t operation_status;
+
+            g_unsealed_session = false;
+            g_full_access_session = false;
+            ESP_LOGI(TAG, "Seal command sent");
+            vTaskDelay(pdMS_TO_TICKS(BMS_SEAL_RETRY_WAIT_MS));
+            if (bms_read_operation_status_with_recovery(&operation_status) == ESP_OK) {
+                bms_log_operation_status(operation_status);
+                if (!bms_security_is_sealed(operation_status)) {
+                    ESP_LOGW(TAG, "Seal attempt %u/%u did not leave BMS sealed",
+                             attempt, BMS_SEAL_ATTEMPTS);
+                    err = ESP_ERR_INVALID_STATE;
+                    continue;
+                }
+            }
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG, "Seal attempt %u/%u failed: %s", attempt, BMS_SEAL_ATTEMPTS,
+                 esp_err_to_name(err));
+        bms_recover_i2c_after_error("I2C bus recovery after seal");
+        vTaskDelay(pdMS_TO_TICKS(BMS_SEAL_RETRY_WAIT_MS));
     }
     return err;
 }
@@ -962,13 +1046,13 @@ typedef struct {
 } bms_profile_t;
 
 typedef struct {
-    uint8_t row[5];
-    uint8_t original[5][BMS_DF_ROW_SIZE];
-    uint8_t updated[5][BMS_DF_ROW_SIZE];
-    bool dirty[5];
+    uint8_t row[BMS_DF_COMMISSION_ROW_COUNT];
+    uint8_t original[BMS_DF_COMMISSION_ROW_COUNT][BMS_DF_ROW_SIZE];
+    uint8_t updated[BMS_DF_COMMISSION_ROW_COUNT][BMS_DF_ROW_SIZE];
+    bool dirty[BMS_DF_COMMISSION_ROW_COUNT];
 } bms_df_image_t;
 
-static const uint8_t k_commission_rows[] = {3, 4, 8, 15, 16};
+static const uint8_t k_commission_rows[] = {3, 4, 8, 9, 15, 16};
 
 static esp_err_t bms_df_select_row(uint8_t row)
 {
@@ -1022,27 +1106,27 @@ static const uint8_t *bms_df_image_const_byte(const bms_df_image_t *image,
 static esp_err_t bms_df_image_read_u16(const bms_df_image_t *image,
                                        uint16_t physical_address, uint16_t *value)
 {
-    const uint8_t *low = bms_df_image_const_byte(image, physical_address);
-    const uint8_t *high = bms_df_image_const_byte(image, (uint16_t)(physical_address + 1U));
+    const uint8_t *high = bms_df_image_const_byte(image, physical_address);
+    const uint8_t *low = bms_df_image_const_byte(image, (uint16_t)(physical_address + 1U));
 
     if (low == NULL || high == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    *value = (uint16_t)*low | ((uint16_t)*high << 8);
+    *value = ((uint16_t)*high << 8) | (uint16_t)*low;
     return ESP_OK;
 }
 
 static esp_err_t bms_df_image_write_u16(bms_df_image_t *image,
                                         uint16_t physical_address, uint16_t value)
 {
-    uint8_t *low = bms_df_image_byte(image, physical_address);
-    uint8_t *high = bms_df_image_byte(image, (uint16_t)(physical_address + 1U));
+    uint8_t *high = bms_df_image_byte(image, physical_address);
+    uint8_t *low = bms_df_image_byte(image, (uint16_t)(physical_address + 1U));
 
     if (low == NULL || high == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    *low = (uint8_t)value;
     *high = (uint8_t)(value >> 8);
+    *low = (uint8_t)value;
     return ESP_OK;
 }
 
@@ -1195,7 +1279,6 @@ static esp_err_t bms_df_apply_profile_to_image(bms_df_image_t *image,
         DF_HIGH_TEMP_CHARGING_SUBCLASS,
         DF_REC_TEMP_CHARGING_SUBCLASS,
     };
-    uint16_t highest_charge_voltage = profile->low_temp_charge_mv;
     static const uint8_t cov_threshold_offsets[] = {
         DF_COV_THRESHOLD_LOW_OFFSET, DF_COV_THRESHOLD_STANDARD_OFFSET,
         DF_COV_THRESHOLD_HIGH_OFFSET, DF_COV_THRESHOLD_REC_OFFSET,
@@ -1204,14 +1287,6 @@ static esp_err_t bms_df_apply_profile_to_image(bms_df_image_t *image,
         DF_COV_RECOVERY_LOW_OFFSET, DF_COV_RECOVERY_STANDARD_OFFSET,
         DF_COV_RECOVERY_HIGH_OFFSET, DF_COV_RECOVERY_REC_OFFSET,
     };
-
-    for (size_t i = 1; i < sizeof(charge_voltages) / sizeof(charge_voltages[0]); ++i) {
-        if (charge_voltages[i] > highest_charge_voltage) {
-            highest_charge_voltage = charge_voltages[i];
-        }
-    }
-    const uint16_t cov_threshold = (uint16_t)(highest_charge_voltage + BMS_COV_MARGIN_MV);
-    const uint16_t cov_recovery = (uint16_t)(highest_charge_voltage - BMS_COV_MARGIN_MV);
 
     ESP_RETURN_ON_ERROR(bms_df_image_write_u16(image,
                                                 DF_SBS_DATA_SUBCLASS + DF_SBS_DESIGN_VOLTAGE_OFFSET,
@@ -1224,17 +1299,43 @@ static esp_err_t bms_df_apply_profile_to_image(bms_df_image_t *image,
                                                 profile->capacity_cwh), TAG, "set DesignCapacity 10mWh");
 
     for (size_t i = 0; i < sizeof(charge_subclasses) / sizeof(charge_subclasses[0]); ++i) {
+        uint16_t old_charge_voltage = 0;
+        uint16_t old_cov_threshold = 0;
+        uint16_t old_cov_recovery = 0;
+        int32_t threshold_margin = BMS_COV_MARGIN_MV;
+        int32_t recovery_margin = -BMS_COV_MARGIN_MV;
+
+        if (bms_df_image_read_u16(image, charge_subclasses[i] + DF_CHARGING_VOLTAGE_OFFSET,
+                                  &old_charge_voltage) == ESP_OK &&
+            bms_df_image_read_u16(image, DF_COV_SUBCLASS + cov_threshold_offsets[i],
+                                  &old_cov_threshold) == ESP_OK &&
+            bms_df_image_read_u16(image, DF_COV_SUBCLASS + cov_recovery_offsets[i],
+                                  &old_cov_recovery) == ESP_OK &&
+            old_charge_voltage >= 2500U && old_charge_voltage <= 4350U &&
+            old_cov_threshold >= old_charge_voltage &&
+            old_cov_recovery <= old_charge_voltage) {
+            threshold_margin = (int32_t)old_cov_threshold - (int32_t)old_charge_voltage;
+            recovery_margin = (int32_t)old_cov_recovery - (int32_t)old_charge_voltage;
+        }
+
+        const int32_t cov_threshold = (int32_t)charge_voltages[i] + threshold_margin;
+        const int32_t cov_recovery = (int32_t)charge_voltages[i] + recovery_margin;
+        if (cov_threshold < 0 || cov_threshold > 32767 ||
+            cov_recovery < 0 || cov_recovery > 32767) {
+            return ESP_ERR_INVALID_ARG;
+        }
+
         ESP_RETURN_ON_ERROR(bms_df_image_write_u16(image,
                                                     charge_subclasses[i] + DF_CHARGING_VOLTAGE_OFFSET,
                                                     charge_voltages[i]), TAG,
                             "set charge voltage %u", (unsigned)i);
         ESP_RETURN_ON_ERROR(bms_df_image_write_u16(image,
                                                     DF_COV_SUBCLASS + cov_threshold_offsets[i],
-                                                    cov_threshold), TAG,
+                                                    (uint16_t)cov_threshold), TAG,
                             "set COV threshold %u", (unsigned)i);
         ESP_RETURN_ON_ERROR(bms_df_image_write_u16(image,
                                                     DF_COV_SUBCLASS + cov_recovery_offsets[i],
-                                                    cov_recovery), TAG,
+                                                    (uint16_t)cov_recovery), TAG,
                             "set COV recovery %u", (unsigned)i);
     }
 
@@ -1347,7 +1448,7 @@ static esp_err_t bms_reset_cudep_pf_in_session(void)
         return err;
     }
     vTaskDelay(pdMS_TO_TICKS(BMS_UNSEAL_WAIT_MS));
-    ESP_RETURN_ON_ERROR(bms_read_mfg_u32(MA_PF_STATUS, &pf_status), TAG,
+    ESP_RETURN_ON_ERROR(bms_read_pf_status_with_recovery(&pf_status), TAG,
                         "read PFStatus after reset");
     bms_log_pf_status(pf_status);
     return pf_status == 0 ? ESP_OK : ESP_ERR_INVALID_STATE;
